@@ -4,17 +4,26 @@ on:
   schedule:
     # 한국 시간(KST) 오전 9시 ~ 오후 4시까지 매 정각 실행 (UTC 00:00~07:00)
     - cron: '0 0-7 * * *'
-  workflow_dispatch: # 원할 때 수동으로 즉시 돌려보는 버튼
+  workflow_dispatch: # 수동 실행 버튼
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
         with:
           python-version: '3.9'
+
       - name: Install dependencies
-        run: pip install dart-fss pandas python-telegram-bot
+        run: |
+          pip install dart-fss pandas python-telegram-bot gspread google-auth
+
       - name: Run Monitoring Bot
+        env:
+          # 아까 등록한 비밀 금고(Secrets)의 열쇠를 불러옵니다
+          GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
         run: python main.py
