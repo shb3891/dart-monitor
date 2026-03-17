@@ -1,0 +1,25 @@
+name: Daily Dart Monitor
+
+on:
+  schedule:
+    - cron: '15 7 * * *' # 한국 시간 오후 4시 15분 (UTC 07:15)
+  workflow_dispatch: # 수동 실행 버튼
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          pip install dart-fss pandas python-telegram-bot
+
+      - name: Run Monitoring Bot
+        run: python main.py
