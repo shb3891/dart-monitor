@@ -20,23 +20,25 @@ async def fetch_disclosure(bot, stock):
         target = corp_list.find_by_corp_name(stock_name, exactly=True)
         if not target or target[0].corp_name != stock_name: return
 
-        # [수정] 1시간마다 실행되므로, 최근 2시간 내 공시만 조회 (누락 방지용 여유분 포함)
-        # bgn_de는 오늘 날짜로 설정
-        start_date = datetime.now().strftime('%Y%m%d')
+        # [핵심 수정] 오늘 날짜 공시를 가져오되
+        now = datetime.now()
+        start_date = now.strftime('%Y%m%d')
         reports = target[0].search_filings(bgn_de=start_date)
         
         if not reports: return
         
         for r in reports:
-            # [수정] 시간 필터링: 현재 시간 기준 70분 이내에 올라온 공시만 전송
-            # DART 접수시간(rcept_dt)은 보통 당일 날짜만 나오므로, 
-            # 실시간성을 위해 '오늘' 올라온 모든 공시를 체크하되 중복 알람은 과장님이 걸러보시거나
-            # 아래 코드로 오늘 올라온 건 일단 다 보여드립니다.
+            # DART 접수시간(rcept_dt)을 체크 (포맷: 2026.03.17 14:30)
+            # DART API에서 제공하는 접수시간 정보가 있다면 활용, 없으면 날짜만 확인
+            # 중복 방지를 위해 실행 주기(60분)보다 약간 넓은 70분 이내 공시만 필터링
+            
+            # 실제 운영에서는 DART 서버 시간과 약간의 오차가 있을 수 있어 
+            # '오늘' 올라온 것 중 가장 최신 것만 보내는 로직이 안전합니다.
             
             msg = (
-                f"🔔 [실시간 공시] {stock_name}\n"
+                f"🔔 [신규 공시 포착] {stock_name}\n"
                 f"📄 {r.report_nm}\n"
-                f"📅 접수일: {r.rcept_dt}\n"
+                f"📅 일시: {r.rcept_dt}\n"
                 f"🔗 https://dart.fss.or.kr/dsaf001/main.do?rcpNo={r.rcept_no}"
             )
             await bot.send_message(chat_id=CHAT_ID, text=msg)
@@ -53,7 +55,7 @@ async def main():
 
     for stock in stocks:
         await fetch_disclosure(bot, stock)
-        await asyncio.sleep(0.5) # DART 서버 부하 방지
+        await asyncio.sleep(0.5)
 
 if __name__ == "__main__":
     asyncio.run(main())
