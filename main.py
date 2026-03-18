@@ -9,11 +9,10 @@ from google.oauth2.service_account import Credentials
 from telegram import Bot
 from datetime import datetime
 
-# --- 설정 정보 (기존 시트 ID를 꼭 확인해서 넣어주세요!) ---
+# --- 설정 정보 (기존 시트 ID 확인 완료!) ---
 DART_API_KEY = 'bfc4e4e445de4727ae0bcc27e80ba5cf0e3818e6'
 TELEGRAM_TOKEN = '8491277145:AAHwHfaG1q-5ZjExFu8o3T9T6X5c8HlLSlI'
 CHAT_ID = '536635522'
-# [중요] 여기에 과장님의 '기존 시트 ID'를 따옴표 사이에 넣어주세요.
 SHEET_ID = '1s73BDNtCPe5mOs9EjBE5npEfcaNtYRyWJxRBUmJI-WA' 
 
 # 깃허브 Secrets에서 가져온 JSON 열쇠 로드
@@ -57,13 +56,14 @@ async def update_sheet(stock_name, report):
         m_info = extract_mezzanine_info(report)
         
         # D열: 날짜, E열: 링크, F열: 행사가액 순으로 업데이트
-        worksheet.update_cell(row, 4, report.rcept_dt) # D열
-        worksheet.update_cell(row, 5, f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={report.rcept_no}") # E열
+        worksheet.update_cell(row, 4, report.rcept_dt) # D열 (Index 4)
+        worksheet.update_cell(row, 5, f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={report.rcept_no}") # E열 (Index 5)
         if m_info["행사가액"]:
-            worksheet.update_cell(row, 6, m_info["행사가액"]) # F열
+            worksheet.update_cell(row, 6, m_info["행사가액"]) # F열 (Index 6)
             
+        print(f"✅ {stock_name} 업데이트 완료!")
     except Exception as e:
-        print(f"시트 업데이트 중 오류 발생 ({stock_name}): {e}")
+        print(f"❌ 시트 업데이트 중 오류 발생 ({stock_name}): {e}")
 
 async def main():
     bot = Bot(token=TELEGRAM_TOKEN)
@@ -71,23 +71,32 @@ async def main():
     data = worksheet.get_all_records()
     stocks = [row['종목명'] for row in data if row.get('종목명')]
 
-    print(f"조회 시작 종목 수: {len(stocks)}개")
+    print(f"🔍 조회 시작 종목 수: {len(stocks)}개")
 
     for stock in stocks:
         target = corp_list.find_by_corp_name(stock, exactly=True)
-        if not target: continue
+        if not target: 
+            print(f"⚠️ {stock} 종목을 DART에서 찾을 수 없습니다.")
+            continue
         
         try:
-            # 오늘 날짜의 공시 검색
-            today_str = datetime.now().strftime('%Y%m%d')
-            reports = target[0].search_filings(bgn_de=today_str)
+            # [테스트용] 3월 15일부터 현재까지의 공시를 검색
+            reports = target[0].search_filings(bgn_de='20260315')
         except Exception:
-            # 공시 데이터가 없거나 에러가 나면 조용히 다음 종목으로 패스
             continue
         
         if not reports: continue
+        
+        print(f"📦 {stock} 종목의 공시를 {len(reports)}건 찾았습니다.")
         
         for r in reports:
             # 1. 텔레그램 발송
             msg = f"🔔 [공시 포착] {stock}\n📄 {r.report_nm}\n🔗 https://dart.fss.or.kr/dsaf001/main.do?rcpNo={r.rcept_no}"
             await bot.send_message(chat_id=CHAT_ID, text=msg)
+            
+            # 2. 시트 업데이트
+            await update_sheet(stock, r)
+            await asyncio.sleep(1)
+
+if __name__ == "__main__":
+    asyncio.run(main())
