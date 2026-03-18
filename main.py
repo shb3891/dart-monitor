@@ -26,13 +26,35 @@ TASK = "ksd.safe.bip.cnts.bone.process.BondSecnDetailPTask"
 SESSION = requests.Session()
 SESSION.headers.update({
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-    'Referer': 'https://seibro.or.kr/websquare/control.jsp?w2xPath=/IPORTAL/user/bond/BIP_CNTS03005V.xml',
-    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-    'X-Requested-With': 'XMLHttpRequest',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'ko-KR,ko;q=0.9',
 })
 
+def init_session():
+    """SEIBRO 세션 초기화 - 쿠키 획득."""
+    print("🔐 SEIBRO 세션 초기화 중...")
+    try:
+        # 1) 메인 페이지 접속
+        SESSION.get("https://seibro.or.kr/websquare/control.jsp?w2xPath=/IPORTAL/user/bond/BIP_CNTS03005V.xml", timeout=10)
+
+        # 2) 종목 조회 페이지 접속 (Referer 설정용)
+        SESSION.get("https://seibro.or.kr/IPORTAL/jsp/processMsg.html", timeout=10)
+
+        # 3) 헤더 업데이트
+        SESSION.headers.update({
+            'Referer': 'https://seibro.or.kr/websquare/control.jsp?w2xPath=/IPORTAL/user/bond/BIP_CNTS03005V.xml',
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Accept': 'application/xml, text/xml, */*',
+        })
+
+        print(f"✅ 세션 초기화 완료. 쿠키: {dict(SESSION.cookies)}")
+        return True
+    except Exception as e:
+        print(f"❌ 세션 초기화 실패: {e}")
+        return False
+
 def seibro_call(action, isin, extra_params=""):
-    """SEIBRO callServletService.jsp 호출."""
     payload = f'<reqParam action="{action}" task="{TASK}"><ISIN value="{isin}"/>{extra_params}</reqParam>'
     try:
         r = SESSION.post(
@@ -42,7 +64,6 @@ def seibro_call(action, isin, extra_params=""):
         )
         r.raise_for_status()
 
-        # EUC-KR 디코딩 후 XML 선언부 제거
         try:
             decoded = r.content.decode('euc-kr', errors='replace')
         except Exception:
@@ -52,7 +73,7 @@ def seibro_call(action, isin, extra_params=""):
 
         if '<!DOCTYPE' in cleaned or '<html' in cleaned.lower():
             print(f"  ❌ HTML 에러페이지 [{action}]")
-            print(f"  📄 Raw: {cleaned[:200]}")
+            print(f"  📄 Raw: {cleaned[:150]}")
             return None
 
         root = ET.fromstring(cleaned.encode('utf-8'))
@@ -60,7 +81,7 @@ def seibro_call(action, isin, extra_params=""):
 
     except ET.ParseError as e:
         print(f"  ❌ XML 파싱 실패 [{action}]: {e}")
-        print(f"  📄 Raw (앞 300자): {r.content[:300]}")
+        print(f"  📄 Raw: {r.content[:200]}")
         return None
     except Exception as e:
         print(f"  ⚠ 호출 실패 [{action}]: {e}")
@@ -99,22 +120,18 @@ def get_mezzanine_data(isin, corp_name):
     xrc_price = '0'
     issu_dt   = '-'
 
-    # ── 1) issuInfoViewEL1: 종목명(회차/종류) + 발행일 ──
+    # ── 1) issuInfoViewEL1: 종목명 + 발행일 ───────────
     root = seibro_call('issuInfoViewEL1', isin)
     if root is not None:
-        # 전체 필드 출력 (디버깅용)
         print(f"  📋 issuInfoViewEL1 필드:")
         for el in root.iter():
             if el.text and el.text.strip():
                 print(f"      {el.tag}: {el.text.strip()}")
 
-        # 발행일
         issu_dt = format_date(
             root.findtext('.//ISSU_DT', '') or
             root.findtext('.//ISS_DT', '')
         )
-
-        # 종목명
         secn_nm = (
             root.findtext('.//KOR_SECN_NM', '') or
             root.findtext('.//SECN_NM', '') or
@@ -122,19 +139,18 @@ def get_mezzanine_data(isin, corp_name):
             root.findtext('.//BOND_ISSU_NM', '')
         )
         print(f"  📌 종목명: {secn_nm} | 발행일: {issu_dt}")
-
         if secn_nm:
             hosu = extract_hosu(secn_nm)
             bond_type = determine_bond_type(secn_nm)
 
-    # ── 2) intPayInfoView: 발행일 보완용 ────────────────
+    # ── 2) intPayInfoView: 발행일 보완 ────────────────
     if issu_dt == '-':
         root2 = seibro_call('intPayInfoView', isin)
         if root2 is not None:
             issu_dt = format_date(root2.findtext('.//ISSU_DT', ''))
             print(f"  📅 발행일(intPayInfoView): {issu_dt}")
 
-    # issuInfoViewEL1 실패 시 A열 종목명으로 보완
+    # A열 종목명으로 보완
     if bond_type == '-':
         bond_type = determine_bond_type(corp_name)
         print(f"  🔄 종류 보완(A열): {bond_type}")
@@ -142,7 +158,7 @@ def get_mezzanine_data(isin, corp_name):
         hosu = extract_hosu(corp_name)
         print(f"  🔄 회차 보완(A열): {hosu}")
 
-    # ── 3) exerDetailListCnt: 행사가격 ─────────────────
+    # ── 3) exerDetailListCnt: 행사가격 ────────────────
     root = seibro_call('exerDetailListCnt', isin,
                        extra_params='<PAGE_ON_CNT value="100"/><PAGE_NUM value="1"/>')
     if root is not None:
@@ -156,7 +172,12 @@ def get_mezzanine_data(isin, corp_name):
     return result
 
 async def main():
-    print("📋 스프레드시트 읽는 중...")
+    # ✅ 세션 먼저 초기화
+    if not init_session():
+        print("❌ 세션 초기화 실패. 종료합니다.")
+        return
+
+    print("\n📋 스프레드시트 읽는 중...")
     all_values = worksheet.get_all_values()
 
     data_rows = [
