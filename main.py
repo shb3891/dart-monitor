@@ -8,7 +8,7 @@ import re
 from google.oauth2.service_account import Credentials
 
 # --- [설정] ---
-SERVICE_KEY = '040c722e03bd9f412852134b7984002f9aaab072aebb672ec28d0792cc996a34'
+SERVICE_KEY = 'e1e03a31bc0583fc0c853d4c41a0dc018dc4d2aa21c363c3d6b1b0b96e85221b'
 SHEET_ID = '1s73BDNtCPe5mOs9EjBE5npEfcaNtYRyWJxRBUmJI-WA'
 
 creds_json = json.loads(os.environ.get('GCP_SERVICE_ACCOUNT_KEY'))
@@ -18,7 +18,8 @@ gc = gspread.authorize(creds)
 sh = gc.open_by_key(SHEET_ID)
 worksheet = sh.get_worksheet(0)
 
-BASE_URL = "http://api.seibro.or.kr/openapi/service/BondSvc"
+# ✅ SEIBRO 자체 오픈플랫폼 (https)
+BASE_URL = "https://api.seibro.or.kr/openapi/service/BondSvc"
 
 TEST_MODE = True
 TEST_LIMIT = 3
@@ -28,33 +29,34 @@ def xml_get(isin, endpoint, extra_params=None):
     if extra_params:
         params.update(extra_params)
     try:
-        r = requests.get(f"{BASE_URL}/{endpoint}", params=params, timeout=10)
+        r = requests.get(
+            f"{BASE_URL}/{endpoint}",
+            params=params,
+            headers={'User-Agent': 'Mozilla/5.0', 'Accept': 'application/xml'},
+            timeout=10
+        )
         r.raise_for_status()
 
-        # ✅ 핵심 수정: 여러 방식으로 파싱 시도
-        raw_bytes = r.content
-        xml_str = None
+        # 응답 타입 확인
+        content_type = r.headers.get('Content-Type', '')
+        print(f"  📡 Content-Type: {content_type}")
 
-        # 방법 1: euc-kr 디코딩 후 xml 선언부 제거하고 utf-8로 재인코딩
+        # HTML 에러페이지 걸러내기
+        if b'<!DOCTYPE' in r.content or b'<html' in r.content:
+            print(f"  ❌ HTML 에러페이지 반환됨 [{isin}] {endpoint}")
+            print(f"  📄 Raw (앞 300자): {r.content[:300]}")
+            return None
+
+        # EUC-KR 디코딩
         try:
-            decoded = raw_bytes.decode('euc-kr', errors='replace')
-            # XML 선언부(<?xml ...?>) 제거 후 파싱 (인코딩 충돌 방지)
-            cleaned = re.sub(r'<\?xml[^?]*\?>', '', decoded).strip()
-            root = ET.fromstring(cleaned.encode('utf-8'))
-        except ET.ParseError:
-            # 방법 2: 바이트 그대로 파싱
-            try:
-                root = ET.fromstring(raw_bytes)
-            except ET.ParseError:
-                # 방법 3: utf-8 강제 디코딩
-                try:
-                    decoded = raw_bytes.decode('utf-8', errors='replace')
-                    cleaned = re.sub(r'<\?xml[^?]*\?>', '', decoded).strip()
-                    root = ET.fromstring(cleaned.encode('utf-8'))
-                except ET.ParseError as e:
-                    print(f"  ❌ XML 파싱 최종 실패 [{isin}] {endpoint}: {e}")
-                    print(f"  📄 Raw (앞 300자): {raw_bytes[:300]}")
-                    return None
+            decoded = r.content.decode('euc-kr', errors='replace')
+        except Exception:
+            decoded = r.content.decode('utf-8', errors='replace')
+
+        # XML 선언부 제거 후 파싱
+        cleaned = re.sub(r'<\?xml[^?]*\?>', '', decoded).strip()
+
+        root = ET.fromstring(cleaned.encode('utf-8'))
 
         result_code = root.findtext('.//resultCode', '')
         if result_code not in ('', '00', '000'):
@@ -64,13 +66,13 @@ def xml_get(isin, endpoint, extra_params=None):
 
         item = root.find('.//item')
 
-        # 디버깅: 필드 전체 출력
         if item is not None:
             print(f"  📋 [{endpoint}] 필드 목록:")
             for child in item:
                 print(f"      {child.tag}: {child.text}")
         else:
-            print(f"  ⚠ [{endpoint}] item 태그 없음. resultCode={result_code}")
+            print(f"  ⚠ [{endpoint}] item 없음. resultCode={result_code}")
+            print(f"  📄 Raw: {decoded[:300]}")
 
         return item
 
@@ -79,6 +81,10 @@ def xml_get(isin, endpoint, extra_params=None):
         return None
     except requests.exceptions.RequestException as e:
         print(f"  🔥 Request 에러 [{isin}] {endpoint}: {e}")
+        return None
+    except ET.ParseError as e:
+        print(f"  ❌ XML 파싱 실패 [{isin}] {endpoint}: {e}")
+        print(f"  📄 Raw (앞 300자): {r.content[:300]}")
         return None
 
 def determine_bond_type(bond_nm):
