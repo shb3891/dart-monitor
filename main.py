@@ -5,6 +5,7 @@ import gspread
 import requests
 import xml.etree.ElementTree as ET
 import re
+import time
 from google.oauth2.service_account import Credentials
 
 # --- [설정] ---
@@ -18,71 +19,86 @@ gc = gspread.authorize(creds)
 sh = gc.open_by_key(SHEET_ID)
 worksheet = sh.get_worksheet(0)
 
-def get_xml_data(url, params):
-    try:
-        res = requests.get(url, params=params, timeout=5)
-        if res.status_code == 200:
-            return ET.fromstring(res.text)
-    except: return None
+def extract_value(item, tags):
+    """API 응답 태그 중 실제 데이터가 있는 첫 번째 값을 반환합니다."""
+    for tag in tags:
+        val = item.findtext(tag)
+        if val and val.strip() and val.strip() not in ['0', '-', 'None']:
+            return val.strip()
     return None
 
-def get_mezzanine_info(isin):
-    # 기본값 설정
-    round_val, b_type, price, start_date = "-", "-", "0", "-"
+def get_mezzanine_full_info(isin):
+    # 순서: [회차, 종류, 행사가액, 발행일, 권리청구시작일]
+    res_data = ["-", "-", "0", "-", "-"]
     
-    # [Step 1] 기본정보 및 발행일 (상세기능 3번 활용)
-    base_url = "http://api.seibro.or.kr/openapi/service/BondSvc/getBondIssuInfo"
-    root = get_xml_data(base_url, {'serviceKey': SERVICE_KEY, 'isin': isin})
-    if root is not None:
-        item = root.find('.//item')
-        if item is not None:
+    # [1] 기본정보 API (회차, 종류, 발행일 추출)
+    url1 = "http://api.seibro.or.kr/openapi/service/BondSvc/getBondIssuInfo"
+    try:
+        r = requests.get(url1, params={'serviceKey': SERVICE_KEY, 'isin': isin}, timeout=5)
+        if "<item>" in r.text:
+            item = ET.fromstring(r.text).find('.//item')
             nm = item.findtext('bondIssuNm', '')
-            r_match = re.search(r'(\d+)회', nm)
-            round_val = r_match.group(1) if r_match else "1"
-            b_type = "CB" if "전환" in nm else ("BW" if "신주" in nm else ("EB" if "교환" in nm else "사채"))
+            # 회차 추출
+            res_data[0] = re.search(r'(\d+)회', nm).group(1) if re.search(r'(\d+)회', nm) else "1"
+            # 종류 판별
+            res_data[1] = "CB" if "전환" in nm else ("BW" if "신주" in nm else ("EB" if "교환" in nm else "사채"))
+            # 발행일 (F열용)
+            res_data[3] = item.findtext('issuDt') or "-"
+    except: pass
 
-    # [Step 2] 권리청구 시작일 (상세기능 5번: 조기상환 정보 활용)
-    opt_url = "http://api.seibro.or.kr/openapi/service/BondSvc/getOptnPutCallInfo"
-    root = get_xml_data(opt_url, {'serviceKey': SERVICE_KEY, 'isin': isin})
-    if root is not None:
-        # 행사시작일(exerStartDt) 태그를 찾아 가장 빠른 날짜 추출
-        dates = [i.text for i in root.findall('.//exerStartDt') if i.text]
-        if dates:
-            start_date = min(dates)
+    # [2] 행사가액 API (E열용)
+    url2 = "http://api.seibro.or.kr/openapi/service/BondSvc/getStockRelBondRightExSittInfo"
+    try:
+        r = requests.get(url2, params={'serviceKey': SERVICE_KEY, 'isin': isin}, timeout=5)
+        if "<item>" in r.text:
+            item = ET.fromstring(r.text).find('.//item')
+            price = extract_value(item, ['issuConvPrice', 'nextConvPrice', 'stkptPrC', 'currConvPrice'])
+            if price: res_data[2] = price
+    except: pass
 
-    # [Step 3] 최신 행사가액 (상세기능 1번: 주식관련 권리행사 현황)
-    stock_url = "http://api.seibro.or.kr/openapi/service/BondSvc/getStockRelBondRightExSittInfo"
-    root = get_xml_data(stock_url, {'serviceKey': SERVICE_KEY, 'isin': isin})
-    if root is not None:
-        # 가장 최근 리픽싱된 행사가액(issuConvPrice) 가져오기
-        p_val = root.findtext('.//issuConvPrice')
-        if p_val and p_val != '0':
-            price = p_val
+    # [3] 권리청구 시작일 API (G열용)
+    url3 = "http://api.seibro.or.kr/openapi/service/BondSvc/getOptnPutCallInfo"
+    try:
+        r = requests.get(url3, params={'serviceKey': SERVICE_KEY, 'isin': isin}, timeout=5)
+        if "<item>" in r.text:
+            items = ET.fromstring(r.text).findall('.//item')
+            dates = []
+            for it in items:
+                d = extract_value(it, ['exerStartDt', 'optnExerStartDt', 'putExerStartDt'])
+                if d: dates.append(d)
+            if dates: res_data[4] = min(dates) # 가장 빠른 행사 가능 날짜
+    except: pass
 
-    return [round_val, b_type, price, start_date]
+    return res_data
 
 async def main():
     all_values = worksheet.get_all_values()
     rows = all_values[1:]
-    final_payload = [] # 시트에 한 번에 뿌릴 데이터 리스트
-
-    print(f"🚀 메자닌 3단 분석 시작: 총 {len(rows)}건")
-
+    
+    print(f"🚀 [데이터 동기화] 총 {len(rows)}건 시작 (F:발행일 / G:청구일)")
+    
+    results = []
     for i, row in enumerate(rows):
         isin = row[1].strip() if len(row) > 1 else ""
         if not isin.startswith('KR'):
-            final_payload.append(["-", "-", "0", "-"])
+            results.append(["-", "-", "0", "-", "-"])
             continue
             
         print(f"🔍 [{i+1}/{len(rows)}] {isin} 분석 중...")
-        data = get_mezzanine_info(isin)
-        final_payload.append(data)
-        await asyncio.sleep(0.3) # 예탁원 API 매너 타임
+        results.append(get_mezzanine_full_info(isin))
+        await asyncio.sleep(0.4) # API 과부하 방지
 
-    # [중요] 429 에러 방지: 리스트를 통째로 한 번에 업데이트 (C2부터 F열까지)
-    if final_payload:
-        worksheet.update(f"C2:F{len(final_payload)+1}", final_payload)
-        print("✅ 시트 업데이트가 완료되었습니다! (범위: C2:F열)")
+    # C열(3번째)부터 G열(7번째)까지 데이터 한꺼번에 업데이트
+    batch_size = 30
+    for j in range(0, len(results), batch_size):
+        chunk = results[j : j + batch_size]
+        range_str = f"C{j+2}:G{j + len(chunk) + 1}"
+        try:
+            worksheet.update(range_str, chunk)
+            print(f"✅ {range_str} 업데이트 완료")
+            time.sleep(1)
+        except Exception as e:
+            print(f"❌ {range_str} 실패: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())
