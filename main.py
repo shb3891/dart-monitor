@@ -20,7 +20,8 @@ worksheet = sh.get_worksheet(0)
 TEST_MODE = True
 TEST_LIMIT = 3
 
-SEIBRO_URL = "https://seibro.or.kr/IPORTAL/jsp/callServletService.jsp"
+# ✅ 올바른 URL로 수정
+SEIBRO_URL = "https://seibro.or.kr/websquare/engine/proworks/callServletService.jsp"
 TASK = "ksd.safe.bip.cnts.bone.process.BondSecnDetailPTask"
 
 SESSION = requests.Session()
@@ -34,20 +35,16 @@ def init_session():
     """SEIBRO 세션 초기화 - 쿠키 획득."""
     print("🔐 SEIBRO 세션 초기화 중...")
     try:
-        # 1) 메인 페이지 접속
-        SESSION.get("https://seibro.or.kr/websquare/control.jsp?w2xPath=/IPORTAL/user/bond/BIP_CNTS03005V.xml", timeout=10)
-
-        # 2) 종목 조회 페이지 접속 (Referer 설정용)
-        SESSION.get("https://seibro.or.kr/IPORTAL/jsp/processMsg.html", timeout=10)
-
-        # 3) 헤더 업데이트
+        SESSION.get(
+            "https://seibro.or.kr/websquare/control.jsp?w2xPath=/IPORTAL/user/bond/BIP_CNTS03005V.xml",
+            timeout=10
+        )
         SESSION.headers.update({
             'Referer': 'https://seibro.or.kr/websquare/control.jsp?w2xPath=/IPORTAL/user/bond/BIP_CNTS03005V.xml',
             'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
             'X-Requested-With': 'XMLHttpRequest',
             'Accept': 'application/xml, text/xml, */*',
         })
-
         print(f"✅ 세션 초기화 완료. 쿠키: {dict(SESSION.cookies)}")
         return True
     except Exception as e:
@@ -172,7 +169,6 @@ def get_mezzanine_data(isin, corp_name):
     return result
 
 async def main():
-    # ✅ 세션 먼저 초기화
     if not init_session():
         print("❌ 세션 초기화 실패. 종료합니다.")
         return
