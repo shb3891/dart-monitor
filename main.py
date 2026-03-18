@@ -18,7 +18,7 @@ sh = gc.open_by_key(SHEET_ID)
 worksheet = sh.get_worksheet(0)
 
 TEST_MODE = True
-TEST_LIMIT = 3
+TEST_LIMIT = 1  # ✅ 일단 1개만
 
 SEIBRO_URL = "https://seibro.or.kr/websquare/engine/proworks/callServletService.jsp"
 TASK = "ksd.safe.bip.cnts.bone.process.BondSecnDetailPTask"
@@ -66,7 +66,13 @@ def seibro_call(action, isin, extra_params=""):
             print(f"  ❌ HTML 에러페이지 [{action}]")
             return None
 
-        return ET.fromstring(cleaned.encode('utf-8'))
+        root = ET.fromstring(cleaned.encode('utf-8'))
+
+        # ✅ 디버깅: 파싱된 XML 전체 출력
+        print(f"  🔍 [{action}] 파싱된 XML:")
+        print(ET.tostring(root, encoding='unicode')[:500])
+
+        return root
 
     except ET.ParseError as e:
         print(f"  ❌ XML 파싱 실패 [{action}]: {e}")
@@ -76,7 +82,6 @@ def seibro_call(action, isin, extra_params=""):
         return None
 
 def get_attr(element, tag):
-    """attribute 방식 XML 파싱: <TAG value="..."/> → 값 반환"""
     el = element.find(f'.//{tag}')
     if el is not None:
         return el.get('value', '')
@@ -105,7 +110,7 @@ def get_mezzanine_data(isin, corp_name):
     xrc_price = '0'
     issu_dt   = '-'
 
-    # ── 1) issuInfoViewEL1: 종목명 + 발행일 + 종류 ───
+    # ── 1) issuInfoViewEL1 ────────────────────────────
     root = seibro_call('issuInfoViewEL1', isin)
     if root is not None:
         result_el = root.find('.//result')
@@ -113,15 +118,13 @@ def get_mezzanine_data(isin, corp_name):
             secn_nm   = get_attr(result_el, 'KOR_SECN_NM')
             issu_dt   = format_date(get_attr(result_el, 'ISSU_DT'))
             bond_type = get_attr(result_el, 'PARTICUL_BOND_KIND')
+            hosu      = extract_hosu(secn_nm)
 
             print(f"  📌 종목명: {secn_nm}")
             print(f"  📅 발행일: {issu_dt}")
             print(f"  🏷 종류: {bond_type}")
-
-            hosu = extract_hosu(secn_nm)
             print(f"  🔢 회차: {hosu}")
 
-            # 종류 보완
             if not bond_type:
                 if 'EB' in secn_nm or '교환' in secn_nm:
                     bond_type = 'EB'
@@ -131,6 +134,9 @@ def get_mezzanine_data(isin, corp_name):
                     bond_type = 'BW'
         else:
             print(f"  ⚠ result 엘리먼트 없음")
+            # ✅ 모든 태그 출력해서 실제 구조 확인
+            for el in root.iter():
+                print(f"      태그: {el.tag}, 속성: {el.attrib}")
 
     # ── 2) exerDetailListCnt: 행사가격 ────────────────
     root2 = seibro_call('exerDetailListCnt', isin,
