@@ -20,7 +20,6 @@ worksheet = sh.get_worksheet(0)
 TEST_MODE = True
 TEST_LIMIT = 3
 
-# ✅ 올바른 URL로 수정
 SEIBRO_URL = "https://seibro.or.kr/websquare/engine/proworks/callServletService.jsp"
 TASK = "ksd.safe.bip.cnts.bone.process.BondSecnDetailPTask"
 
@@ -32,7 +31,6 @@ SESSION.headers.update({
 })
 
 def init_session():
-    """SEIBRO 세션 초기화 - 쿠키 획득."""
     print("🔐 SEIBRO 세션 초기화 중...")
     try:
         SESSION.get(
@@ -45,7 +43,7 @@ def init_session():
             'X-Requested-With': 'XMLHttpRequest',
             'Accept': 'application/xml, text/xml, */*',
         })
-        print(f"✅ 세션 초기화 완료. 쿠키: {dict(SESSION.cookies)}")
+        print(f"✅ 세션 초기화 완료")
         return True
     except Exception as e:
         print(f"❌ 세션 초기화 실패: {e}")
@@ -54,11 +52,7 @@ def init_session():
 def seibro_call(action, isin, extra_params=""):
     payload = f'<reqParam action="{action}" task="{TASK}"><ISIN value="{isin}"/>{extra_params}</reqParam>'
     try:
-        r = SESSION.post(
-            SEIBRO_URL,
-            data={'reqParam': payload},
-            timeout=10
-        )
+        r = SESSION.post(SEIBRO_URL, data={'reqParam': payload}, timeout=10)
         r.raise_for_status()
 
         try:
@@ -70,19 +64,23 @@ def seibro_call(action, isin, extra_params=""):
 
         if '<!DOCTYPE' in cleaned or '<html' in cleaned.lower():
             print(f"  ❌ HTML 에러페이지 [{action}]")
-            print(f"  📄 Raw: {cleaned[:150]}")
             return None
 
-        root = ET.fromstring(cleaned.encode('utf-8'))
-        return root
+        return ET.fromstring(cleaned.encode('utf-8'))
 
     except ET.ParseError as e:
         print(f"  ❌ XML 파싱 실패 [{action}]: {e}")
-        print(f"  📄 Raw: {r.content[:200]}")
         return None
     except Exception as e:
         print(f"  ⚠ 호출 실패 [{action}]: {e}")
         return None
+
+def get_attr(element, tag):
+    """✅ attribute 방식 XML 파싱: <TAG value="..."/> → 값 반환"""
+    el = element.find(f'.//{tag}')
+    if el is not None:
+        return el.get('value', '')
+    return ''
 
 def format_date(raw):
     if raw and len(raw) == 8 and raw.isdigit():
@@ -98,16 +96,6 @@ def extract_hosu(nm):
         return m.group(1)
     return '-'
 
-def determine_bond_type(nm):
-    nm = nm or ''
-    if 'EB' in nm or '교환' in nm:
-        return 'EB'
-    if 'CB' in nm or '전환' in nm:
-        return 'CB'
-    if 'BW' in nm or '신주인수' in nm:
-        return 'BW'
-    return '-'
-
 def get_mezzanine_data(isin, corp_name):
     print(f"\n{'='*50}")
     print(f"  🔍 조회 중: {isin} ({corp_name})")
@@ -117,51 +105,37 @@ def get_mezzanine_data(isin, corp_name):
     xrc_price = '0'
     issu_dt   = '-'
 
-    # ── 1) issuInfoViewEL1: 종목명 + 발행일 ───────────
+    # ── 1) issuInfoViewEL1: 종목명 + 발행일 + 종류 ───
     root = seibro_call('issuInfoViewEL1', isin)
     if root is not None:
-        print(f"  📋 issuInfoViewEL1 필드:")
-        for el in root.iter():
-            if el.text and el.text.strip():
-                print(f"      {el.tag}: {el.text.strip()}")
+        secn_nm   = get_attr(root, 'KOR_SECN_NM')
+        issu_dt   = format_date(get_attr(root, 'ISSU_DT'))
+        bond_type = get_attr(root, 'PARTICUL_BOND_KIND')  # EB/CB/BW 직접!
 
-        issu_dt = format_date(
-            root.findtext('.//ISSU_DT', '') or
-            root.findtext('.//ISS_DT', '')
-        )
-        secn_nm = (
-            root.findtext('.//KOR_SECN_NM', '') or
-            root.findtext('.//SECN_NM', '') or
-            root.findtext('.//BOND_NM', '') or
-            root.findtext('.//BOND_ISSU_NM', '')
-        )
-        print(f"  📌 종목명: {secn_nm} | 발행일: {issu_dt}")
-        if secn_nm:
-            hosu = extract_hosu(secn_nm)
-            bond_type = determine_bond_type(secn_nm)
+        print(f"  📌 종목명: {secn_nm}")
+        print(f"  📅 발행일: {issu_dt}")
+        print(f"  🏷 종류: {bond_type}")
 
-    # ── 2) intPayInfoView: 발행일 보완 ────────────────
-    if issu_dt == '-':
-        root2 = seibro_call('intPayInfoView', isin)
-        if root2 is not None:
-            issu_dt = format_date(root2.findtext('.//ISSU_DT', ''))
-            print(f"  📅 발행일(intPayInfoView): {issu_dt}")
+        hosu = extract_hosu(secn_nm)
+        print(f"  🔢 회차: {hosu}")
 
-    # A열 종목명으로 보완
-    if bond_type == '-':
-        bond_type = determine_bond_type(corp_name)
-        print(f"  🔄 종류 보완(A열): {bond_type}")
-    if hosu == '-':
-        hosu = extract_hosu(corp_name)
-        print(f"  🔄 회차 보완(A열): {hosu}")
+    # 보완: PARTICUL_BOND_KIND 없을 경우 종목명으로 판단
+    if not bond_type or bond_type == '-':
+        nm = get_attr(root, 'KOR_SECN_NM') if root else corp_name
+        if 'EB' in nm or '교환' in nm:
+            bond_type = 'EB'
+        elif 'CB' in nm or '전환' in nm:
+            bond_type = 'CB'
+        elif 'BW' in nm or '신주인수' in nm:
+            bond_type = 'BW'
 
-    # ── 3) exerDetailListCnt: 행사가격 ────────────────
-    root = seibro_call('exerDetailListCnt', isin,
-                       extra_params='<PAGE_ON_CNT value="100"/><PAGE_NUM value="1"/>')
-    if root is not None:
-        item = root.find('.//result')
-        if item is not None:
-            xrc_price = item.findtext('XRC_PRICE', '0').replace(',', '')
+    # ── 2) exerDetailListCnt: 행사가격 ────────────────
+    root2 = seibro_call('exerDetailListCnt', isin,
+                        extra_params='<PAGE_ON_CNT value="100"/><PAGE_NUM value="1"/>')
+    if root2 is not None:
+        result_el = root2.find('.//result')
+        if result_el is not None:
+            xrc_price = get_attr(result_el, 'XRC_PRICE').replace(',', '')
             print(f"  💰 행사가격: {xrc_price}")
 
     result = [hosu, bond_type, xrc_price, issu_dt, '-']
