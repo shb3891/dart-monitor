@@ -27,7 +27,6 @@ TEST_LIMIT = 3
 
 # ── DART 회사 고유번호 전체 목록 로드 ──────────────────────────
 def load_corp_codes():
-    """DART 전체 회사 고유번호 ZIP 다운로드 후 파싱."""
     print("📥 DART 회사 고유번호 목록 다운로드 중...")
     r = requests.get(
         f"{DART_URL}/corpCode.xml",
@@ -38,41 +37,45 @@ def load_corp_codes():
     xml_data = z.read('CORPCODE.xml')
     root = ET.fromstring(xml_data)
 
-    corp_map = {}  # 회사명 → corp_code
+    corp_map = {}
     for item in root.findall('.//list'):
         name = item.findtext('corp_name', '').strip()
         code = item.findtext('corp_code', '').strip()
-        stock_code = item.findtext('stock_code', '').strip()
         if name and code:
-            corp_map[name] = {'corp_code': code, 'stock_code': stock_code}
+            corp_map[name] = code
 
     print(f"✅ 총 {len(corp_map)}개 회사 로드 완료")
     return corp_map
 
 # ── DART 공시 검색 ──────────────────────────────────────────────
-def search_disclosure(corp_code, pblntf_detail_ty):
+def search_disclosure(corp_code, keyword):
     """
-    CB: 'C001' / EB: 'C002' / BW: 'C003'
+    주요사항보고서(B001) 중 키워드가 포함된 공시 검색
+    keyword: '전환사채' or '교환사채' or '신주인수권'
     """
     r = requests.get(
         f"{DART_URL}/list.json",
         params={
             'crtfc_key': DART_API_KEY,
             'corp_code': corp_code,
-            'pblntf_ty': 'B',           # 주요사항보고
-            'pblntf_detail_ty': pblntf_detail_ty,
-            'page_count': 5,
+            'pblntf_detail_ty': 'B001',  # ✅ 주요사항보고서
+            'page_count': 10,
         },
         timeout=10
     )
     data = r.json()
     if data.get('status') == '000' and data.get('list'):
-        return data['list']  # 최신 공시 목록
+        # 키워드로 필터링
+        matched = [
+            d for d in data['list']
+            if keyword in d.get('report_nm', '')
+        ]
+        return matched
     return []
 
 # ── 공시 원문에서 데이터 파싱 ───────────────────────────────────
-def get_document_data(rcept_no):
-    """공시 원문 ZIP에서 XML 파싱하여 전환가액, 발행일, 권리청구시작일 추출."""
+def get_document_text(rcept_no):
+    """공시 원문 ZIP에서 텍스트 추출."""
     r = requests.get(
         f"{DART_URL}/document.xml",
         params={'crtfc_key': DART_API_KEY, 'rcept_no': rcept_no},
@@ -80,54 +83,67 @@ def get_document_data(rcept_no):
     )
     try:
         z = zipfile.ZipFile(io.BytesIO(r.content))
-        # XML 파일 찾기
         xml_files = [f for f in z.namelist() if f.endswith('.xml')]
         if not xml_files:
-            return None
+            return ''
         xml_data = z.read(xml_files[0])
         return xml_data.decode('utf-8', errors='replace')
     except Exception as e:
         print(f"    ⚠ 원문 파싱 실패: {e}")
-        return None
+        return ''
 
-def parse_from_text(text, patterns):
-    """정규식 패턴 리스트로 값 추출."""
+def parse_value(text, patterns):
     for pattern in patterns:
         m = re.search(pattern, text, re.DOTALL)
         if m:
-            val = m.group(1).strip().replace(',', '').replace(' ', '')
+            val = m.group(1).strip().replace(',', '').replace(' ', '').replace('\n', '')
             if val and val not in ('-', ''):
                 return val
     return None
+
+def normalize_date(val):
+    """날짜 문자열 정규화 → YYYY-MM-DD"""
+    if not val:
+        return '-'
+    val = re.sub(r'[년\s]', '-', val)
+    val = re.sub(r'[월\s]', '-', val)
+    val = re.sub(r'[일\s]', '', val)
+    val = re.sub(r'\.', '-', val)
+    val = re.sub(r'-+', '-', val).strip('-')
+    # YYYYMMDD 형태 처리
+    if re.match(r'^\d{8}$', val):
+        return f"{val[:4]}-{val[4:6]}-{val[6:]}"
+    return val
 
 # ── 메인 데이터 추출 ────────────────────────────────────────────
 def get_mezzanine_data(corp_name, corp_map):
     print(f"\n{'='*50}")
     print(f"  🔍 조회 중: {corp_name}")
 
-    corp_info = corp_map.get(corp_name)
-    if not corp_info:
+    corp_code = corp_map.get(corp_name)
+    if not corp_code:
         print(f"  ❌ DART에서 회사명 없음: {corp_name}")
         return ['-', '-', '0', '-', '-']
 
-    corp_code = corp_info['corp_code']
     print(f"  📌 corp_code: {corp_code}")
 
     # CB → EB → BW 순서로 공시 검색
-    type_map = {
-        'CB': 'C001',
-        'EB': 'C002',
-        'BW': 'C003',
-    }
+    type_search = [
+        ('CB', '전환사채'),
+        ('EB', '교환사채'),
+        ('BW', '신주인수권'),
+    ]
 
     disclosures = []
     bond_type = '-'
 
-    for btype, code in type_map.items():
-        disclosures = search_disclosure(corp_code, code)
+    for btype, keyword in type_search:
+        disclosures = search_disclosure(corp_code, keyword)
         if disclosures:
             bond_type = btype
             print(f"  ✅ {btype} 공시 {len(disclosures)}건 발견")
+            for d in disclosures[:3]:
+                print(f"    - {d['report_nm']} ({d['rcept_dt']})")
             break
 
     if not disclosures:
@@ -137,7 +153,7 @@ def get_mezzanine_data(corp_name, corp_map):
     # 가장 최신 공시
     latest = disclosures[0]
     rcept_no = latest.get('rcept_no', '')
-    rcept_dt = latest.get('rcept_dt', '')  # 접수일 = 대략 발행일
+    rcept_dt = latest.get('rcept_dt', '')
     report_nm = latest.get('report_nm', '')
 
     print(f"  📄 공시: {report_nm} ({rcept_dt})")
@@ -148,43 +164,45 @@ def get_mezzanine_data(corp_name, corp_map):
     if m:
         hosu = m.group(1)
 
-    # 발행일 포맷
-    issu_dt = '-'
-    if rcept_dt and len(rcept_dt) == 8:
-        issu_dt = f"{rcept_dt[:4]}-{rcept_dt[4:6]}-{rcept_dt[6:]}"
+    # 발행일 (접수일 기준)
+    issu_dt = normalize_date(rcept_dt)
 
     exercise_price = '0'
     right_start_dt = '-'
 
     # 공시 원문 파싱
-    doc_text = get_document_data(rcept_no)
+    doc_text = get_document_text(rcept_no)
     if doc_text:
-        # 전환가액 패턴
+        print(f"  📝 원문 길이: {len(doc_text)}자")
+
+        # 전환/행사가액 패턴
         price_patterns = [
-            r'전환가액[^\d]*?([\d,]+)\s*원',
-            r'교환가액[^\d]*?([\d,]+)\s*원',
-            r'행사가액[^\d]*?([\d,]+)\s*원',
-            r'전환가격[^\d]*?([\d,]+)\s*원',
+            r'전환가액[^0-9]*([\d,]+)\s*원',
+            r'교환가액[^0-9]*([\d,]+)\s*원',
+            r'행사가액[^0-9]*([\d,]+)\s*원',
+            r'전환가격[^0-9]*([\d,]+)\s*원',
+            r'전환가액</td>[^<]*<td[^>]*>[^0-9]*([\d,]+)',
+            r'행사가액</td>[^<]*<td[^>]*>[^0-9]*([\d,]+)',
         ]
-        val = parse_from_text(doc_text, price_patterns)
+        val = parse_value(doc_text, price_patterns)
         if val:
             exercise_price = val
             print(f"  💰 행사가액: {exercise_price}")
 
         # 권리청구시작일 패턴
         date_patterns = [
-            r'전환(?:청구)?(?:기간|시작)[^\d]*?(\d{4}[년\-\.]\s*\d{1,2}[월\-\.]\s*\d{1,2})',
-            r'전환권\s*행사\s*기간[^\d]*?(\d{4}[년\-\.]\s*\d{1,2}[월\-\.]\s*\d{1,2})',
-            r'교환청구기간[^\d]*?(\d{4}[년\-\.]\s*\d{1,2}[월\-\.]\s*\d{1,2})',
-            r'행사기간[^\d]*?(\d{4}[년\-\.]\s*\d{1,2}[월\-\.]\s*\d{1,2})',
+            r'전환청구기간[^0-9]*(\d{4}[년\-\.\s]\s*\d{1,2}[월\-\.\s]\s*\d{1,2})',
+            r'전환권\s*행사\s*기간[^0-9]*(\d{4}[년\-\.\s]\s*\d{1,2}[월\-\.\s]\s*\d{1,2})',
+            r'전환청구\s*시작일[^0-9]*(\d{4}[년\-\.\s]\s*\d{1,2}[월\-\.\s]\s*\d{1,2})',
+            r'교환청구기간[^0-9]*(\d{4}[년\-\.\s]\s*\d{1,2}[월\-\.\s]\s*\d{1,2})',
+            r'행사기간[^0-9]*(\d{4}[년\-\.\s]\s*\d{1,2}[월\-\.\s]\s*\d{1,2})',
         ]
-        val = parse_from_text(doc_text, date_patterns)
+        val = parse_value(doc_text, date_patterns)
         if val:
-            # 날짜 정규화
-            val = re.sub(r'[년월\.\s]', '-', val).strip('-')
-            val = re.sub(r'-+', '-', val)
-            right_start_dt = val
+            right_start_dt = normalize_date(val)
             print(f"  📅 권리청구시작일: {right_start_dt}")
+    else:
+        print(f"  ⚠ 원문 없음")
 
     result = [hosu, bond_type, exercise_price, issu_dt, right_start_dt]
     print(f"  ✅ 최종 결과: {result}")
@@ -192,7 +210,6 @@ def get_mezzanine_data(corp_name, corp_map):
 
 # ── 메인 ────────────────────────────────────────────────────────
 async def main():
-    # DART 회사 목록 로드
     corp_map = load_corp_codes()
 
     print("\n📋 스프레드시트 읽는 중...")
