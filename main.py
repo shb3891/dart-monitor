@@ -20,8 +20,10 @@ worksheet = sh.get_worksheet(0)
 
 BASE_URL = "http://api.seibro.or.kr/openapi/service/BondSvc"
 
+TEST_MODE = True
+TEST_LIMIT = 3
+
 def xml_get(isin, endpoint, extra_params=None):
-    """SEIBRO API 호출 공통 함수. item 엘리먼트 반환, 없으면 None."""
     params = {'serviceKey': SERVICE_KEY, 'isin': isin}
     if extra_params:
         params.update(extra_params)
@@ -29,10 +31,30 @@ def xml_get(isin, endpoint, extra_params=None):
         r = requests.get(f"{BASE_URL}/{endpoint}", params=params, timeout=10)
         r.raise_for_status()
 
-        # ✅ SEIBRO는 EUC-KR 인코딩으로 응답 → UTF-8로 변환 후 파싱
-        r.encoding = 'euc-kr'
-        xml_text = r.text.encode('utf-8')
-        root = ET.fromstring(xml_text)
+        # ✅ 핵심 수정: 여러 방식으로 파싱 시도
+        raw_bytes = r.content
+        xml_str = None
+
+        # 방법 1: euc-kr 디코딩 후 xml 선언부 제거하고 utf-8로 재인코딩
+        try:
+            decoded = raw_bytes.decode('euc-kr', errors='replace')
+            # XML 선언부(<?xml ...?>) 제거 후 파싱 (인코딩 충돌 방지)
+            cleaned = re.sub(r'<\?xml[^?]*\?>', '', decoded).strip()
+            root = ET.fromstring(cleaned.encode('utf-8'))
+        except ET.ParseError:
+            # 방법 2: 바이트 그대로 파싱
+            try:
+                root = ET.fromstring(raw_bytes)
+            except ET.ParseError:
+                # 방법 3: utf-8 강제 디코딩
+                try:
+                    decoded = raw_bytes.decode('utf-8', errors='replace')
+                    cleaned = re.sub(r'<\?xml[^?]*\?>', '', decoded).strip()
+                    root = ET.fromstring(cleaned.encode('utf-8'))
+                except ET.ParseError as e:
+                    print(f"  ❌ XML 파싱 최종 실패 [{isin}] {endpoint}: {e}")
+                    print(f"  📄 Raw (앞 300자): {raw_bytes[:300]}")
+                    return None
 
         result_code = root.findtext('.//resultCode', '')
         if result_code not in ('', '00', '000'):
@@ -41,6 +63,15 @@ def xml_get(isin, endpoint, extra_params=None):
             return None
 
         item = root.find('.//item')
+
+        # 디버깅: 필드 전체 출력
+        if item is not None:
+            print(f"  📋 [{endpoint}] 필드 목록:")
+            for child in item:
+                print(f"      {child.tag}: {child.text}")
+        else:
+            print(f"  ⚠ [{endpoint}] item 태그 없음. resultCode={result_code}")
+
         return item
 
     except requests.exceptions.Timeout:
@@ -49,29 +80,23 @@ def xml_get(isin, endpoint, extra_params=None):
     except requests.exceptions.RequestException as e:
         print(f"  🔥 Request 에러 [{isin}] {endpoint}: {e}")
         return None
-    except ET.ParseError as e:
-        print(f"  ❌ XML 파싱 에러 [{isin}] {endpoint}: {e}")
-        return None
 
 def determine_bond_type(bond_nm):
-    """채권명으로 메자닌 종류 판단."""
     nm = bond_nm or ''
-    if '전환' in nm or 'CB' in nm.upper():
+    if '전환' in nm:
         return 'CB'
-    if '교환' in nm or 'EB' in nm.upper():
+    if '교환' in nm:
         return 'EB'
-    if '신주인수' in nm or 'BW' in nm.upper():
+    if '신주인수' in nm:
         return 'BW'
     return 'CB'
 
 def format_date(raw):
-    """YYYYMMDD → YYYY-MM-DD 변환."""
     if raw and len(raw) == 8 and raw.isdigit():
         return f"{raw[:4]}-{raw[4:6]}-{raw[6:]}"
     return raw or '-'
 
 def extract_hosu(bond_nm):
-    """채권명에서 회차 추출."""
     m = re.search(r'제\s*(\d+)\s*회', bond_nm or '')
     if m:
         return m.group(1)
@@ -81,7 +106,7 @@ def extract_hosu(bond_nm):
     return '1'
 
 def get_mezzanine_data(isin):
-    """ISIN으로 메자닌 채권 정보를 SEIBRO에서 가져옵니다."""
+    print(f"\n{'='*50}")
     print(f"  🔍 조회 중: {isin}")
 
     item = xml_get(isin, 'getBondIssuInfo')
@@ -95,6 +120,8 @@ def get_mezzanine_data(isin):
     hosu        = extract_hosu(bond_nm)
     bond_type   = determine_bond_type(bond_nm)
     issu_dt_fmt = format_date(issu_dt)
+
+    print(f"  📌 채권명: {bond_nm} | 회차: {hosu} | 종류: {bond_type} | 발행일: {issu_dt_fmt}")
 
     exercise_price = '0'
     right_start_dt = '-'
@@ -110,30 +137,22 @@ def get_mezzanine_data(isin):
         detail = xml_get(isin, detail_endpoint)
 
         if detail is not None:
-            # 행사가액 필드 순서대로 시도
             for field in ['convPrcNow', 'convPrice', 'exchPrc', 'wrantExrcPrc', 'issuConvPrice']:
                 val = detail.findtext(field, '')
                 if val and val.strip() not in ('', '0', '-'):
                     exercise_price = val.strip().replace(',', '')
+                    print(f"  💰 행사가액: {field} = {exercise_price}")
                     break
 
-            # 권리청구 시작일 필드 순서대로 시도
             for field in ['convAplcStrtDt', 'exchAplcStrtDt', 'wrantExrcStrtDt', 'rightStrtDt']:
                 val = detail.findtext(field, '')
                 if val and val.strip() not in ('', '-'):
                     right_start_dt = format_date(val.strip())
+                    print(f"  📅 권리청구시작일: {field} = {right_start_dt}")
                     break
 
-    # 행사가액이 여전히 0이면 기본정보에서 재시도
-    if exercise_price == '0':
-        for field in ['issuConvPrice', 'convPrc', 'exchPrc']:
-            val = item.findtext(field, '')
-            if val and val.strip() not in ('', '0', '-'):
-                exercise_price = val.strip().replace(',', '')
-                break
-
     result = [hosu, bond_type, exercise_price, issu_dt_fmt, right_start_dt]
-    print(f"  ✅ {bond_nm} → {result}")
+    print(f"  ✅ 최종 결과: {result}")
     return result
 
 async def main():
@@ -146,7 +165,9 @@ async def main():
         if len(row) > 1 and row[1].strip().startswith('KR')
     ]
 
-    print(f"🚀 총 {len(data_rows)}개 종목 처리 시작\n")
+    if TEST_MODE:
+        data_rows = data_rows[:TEST_LIMIT]
+        print(f"🧪 테스트 모드: 상위 {TEST_LIMIT}개 종목만 실행\n")
 
     batch_updates = []
     start_row = data_rows[0][0] if data_rows else 2
@@ -155,7 +176,7 @@ async def main():
         isin = row[1].strip()
         result = get_mezzanine_data(isin)
         batch_updates.append(result)
-        await asyncio.sleep(1.2)  # API 호출 간격
+        await asyncio.sleep(1.2)
 
     if batch_updates:
         end_row = start_row + len(batch_updates) - 1
