@@ -1,5 +1,4 @@
 import dart_fss as dart
-import pandas as pd
 import asyncio
 import os
 import json
@@ -20,42 +19,37 @@ sh = gc.open_by_key(SHEET_ID)
 worksheet = sh.get_worksheet(0)
 
 dart.set_api_key(api_key=DART_API_KEY)
-corp_list = dart.get_corp_list()
 
-def parse_mezzanine_by_isin(report, isin_code):
-    """공시 본문에서 ISIN 코드를 포함한 모든 텍스트를 정밀 탐색합니다."""
-    info = {"회차": "", "종류": "", "행사가액": "", "청구시작": "", "청구종료": ""}
-    # 공백 제거 및 대문자 변환으로 매칭 확률 업
-    target_isin = isin_code.strip().upper()
-    
+def parse_mezzanine_details(report, target_isin):
+    """공시 본문에서 ISIN과 일치하는 행의 데이터를 정밀 추출합니다."""
     try:
         tables = report.extract_tables()
         for table in tables:
             df = table.to_df()
-            # 모든 셀의 내용을 합쳐서 검색
-            table_text = df.to_string().replace(" ", "").upper()
+            # 데이터프레임의 모든 내용을 문자열로 변환
+            raw_text = df.to_string().replace(" ", "").upper()
             
-            if target_isin in table_text:
-                print(f"🎯 매칭 성공! 공시명: {report.report_nm}")
-                # 종류 추출
-                if "전환사채" in table_text or "CB" in table_text: info["종류"] = "CB"
-                elif "신주인수권" in table_text or "BW" in table_text: info["종류"] = "BW"
-                elif "교환사채" in table_text or "EB" in table_text: info["종류"] = "EB"
+            if target_isin in raw_text:
+                res = {"회차": "", "종류": "", "가격": "", "날짜": ""}
                 
-                # 회차 추출
-                round_match = re.search(r'제?(\d+)회', table_text)
-                if round_match: info["회차"] = round_match.group(1)
+                # 종류 판별
+                if "전환사채" in raw_text or "CB" in raw_text: res["종류"] = "CB"
+                elif "신주인수권" in raw_text or "BW" in raw_text: res["종류"] = "BW"
+                elif "교환사채" in raw_text or "EB" in raw_text: res["종류"] = "EB"
                 
-                # 행사가액 (원 단위 앞의 숫자들)
-                price_match = re.search(r'([\d,]+)원', table_text)
-                if price_match: info["행사가액"] = price_match.group(1)
+                # 회차 (숫자만 추출)
+                round_match = re.search(r'제?\s*(\d+)\s*회', raw_text)
+                if round_match: res["회차"] = round_match.group(1)
                 
-                # 날짜 추출 (가장 먼저 나오는 날짜 2개를 청구기간으로 간주)
-                dates = re.findall(r'20\d{2}[\.\-\/]\d{2}[\.\-\/]\d{2}', table_text)
-                if len(dates) >= 2:
-                    info["청구시작"], info["청구종료"] = dates[0], dates[1]
+                # 가액 (숫자+원)
+                price_match = re.search(r'([\d,]+)원', raw_text)
+                if price_match: res["가격"] = price_match.group(1)
                 
-                return info
+                # 청구시작일 (가장 빠른 날짜)
+                dates = re.findall(r'20\d{2}[\.\-\/]\d{2}[\.\-\/]\d{2}', raw_text)
+                if dates: res["날짜"] = sorted(dates)[0]
+                
+                return res
         return None
     except:
         return None
@@ -65,43 +59,51 @@ async def main():
     if not all_values: return
     
     rows = all_values[1:]
+    # 확실한 발행 정보를 위해 3년치 검색
     bgn_de = (datetime.now() - timedelta(days=1100)).strftime('%Y%m%d')
 
-    print(f"🚀 [디버깅 모드] {len(rows)}개 종목 분석 시작...")
+    print(f"🚀 [정밀 분석 모드] {len(rows)}개 종목 분석을 시작합니다.")
 
     for i, row in enumerate(rows):
-        full_name = row[0]
-        # 종목명에서 괄호나 숫자 제거하고 순수 이름만 추출
-        stock_name = re.sub(r'[()\d\s\w]*$', '', full_name).strip()
-        if not stock_name: stock_name = full_name.split()[0]
+        stock_name = row[0].strip()
+        isin_code = row[1].strip().upper() # B열 예탁원 코드
         
-        isin_code = row[1]
-        if not isin_code: continue
+        if not isin_code or not stock_name: continue
         
-        print(f"🔍 {stock_name} ({isin_code}) 검색 중...")
-        
-        target = corp_list.find_by_corp_name(stock_name, exactly=False)
-        if not target: continue
+        print(f"🔍 [{i+1}/{len(rows)}] {stock_name} ({isin_code}) 본문 파싱 중...")
         
         try:
-            # 주요사항보고서(B)와 발행공시(I)를 우선순위로 검색
-            reports = target[0].search_filings(bgn_de=bgn_de, p_kind=['B', 'I', 'A'])
-            if not reports: continue
-        except: continue
+            # 주요사항보고서(발행결정)를 최우선으로 검색
+            reports = dart.search_filings(corp_name=stock_name, bgn_de=bgn_de, p_kind='B')
+            # 주요사항에 없으면 정기공시(사업보고서 등) 검색
+            if not reports:
+                reports = dart.search_filings(corp_name=stock_name, bgn_de=bgn_de, p_kind='A')
+            
+            if not reports:
+                print(f"   - 관련 공시를 찾지 못했습니다.")
+                continue
 
-        for r in reports:
-            found_data = parse_mezzanine_by_isin(r, isin_code)
-            if found_data:
-                row_idx = i + 2
-                # 일괄 업데이트 대신 하나씩 확인하며 입력
-                if found_data["회차"]: worksheet.update_cell(row_idx, 3, found_data["회차"])
-                if found_data["종류"]: worksheet.update_cell(row_idx, 4, found_data["종류"])
-                if found_data["행사가액"]: worksheet.update_cell(row_idx, 5, found_data["행사가액"])
-                if found_data["청구시작"]: worksheet.update_cell(row_idx, 6, found_data["청구시작"])
-                print(f"✅ {stock_name} 입력 완료!")
-                break
-        
-        await asyncio.sleep(1)
+            success = False
+            for r in reports:
+                data = parse_mezzanine_details(r, isin_code)
+                if data:
+                    row_idx = i + 2
+                    # 찾은 데이터 시트에 기록
+                    if data["회차"]: worksheet.update_cell(row_idx, 3, data["회차"])
+                    if data["종류"]: worksheet.update_cell(row_idx, 4, data["종류"])
+                    if data["가격"]: worksheet.update_cell(row_idx, 5, data["가격"])
+                    if data["날짜"]: worksheet.update_cell(row_idx, 6, data["날짜"])
+                    print(f"   ✅ 데이터 입력 완료!")
+                    success = True
+                    break
+            
+            if not success:
+                print(f"   - ISIN 매칭 실패")
+                
+        except Exception as e:
+            print(f"   - 에러 발생: {e}")
+            
+        await asyncio.sleep(1.5) # DART 서버 부하 방지
 
 if __name__ == "__main__":
     asyncio.run(main())
