@@ -8,7 +8,7 @@ import re
 from google.oauth2.service_account import Credentials
 
 # --- [설정] ---
-SHEET_ID = '1s73BDNtCPe5mOs9EjBE5npEfcaNtYRyWJxRBUmJI-WA'
+SHEET_ID = '1s73BDNtCPe5mOs9EjBUmJI-WA'
 
 creds_json = json.loads(os.environ.get('GCP_SERVICE_ACCOUNT_KEY'))
 scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
@@ -40,8 +40,29 @@ def seibro_call(action, isin):
             timeout=10
         )
         r.raise_for_status()
-        root = ET.fromstring(r.content)
+
+        # ✅ 핵심: EUC-KR 디코딩 후 XML 선언부 제거
+        try:
+            decoded = r.content.decode('euc-kr', errors='replace')
+        except Exception:
+            decoded = r.content.decode('utf-8', errors='replace')
+
+        # XML 선언부 제거 (인코딩 충돌 방지)
+        cleaned = re.sub(r'<\?xml[^?]*\?>', '', decoded).strip()
+
+        # HTML 에러페이지 체크
+        if '<!DOCTYPE' in cleaned or '<html' in cleaned.lower():
+            print(f"  ❌ HTML 에러페이지 [{action}]")
+            print(f"  📄 Raw: {cleaned[:200]}")
+            return None
+
+        root = ET.fromstring(cleaned.encode('utf-8'))
         return root
+
+    except ET.ParseError as e:
+        print(f"  ❌ XML 파싱 실패 [{action}]: {e}")
+        print(f"  📄 Raw (앞 300자): {r.content[:300]}")
+        return None
     except Exception as e:
         print(f"  ⚠ 호출 실패 [{action}]: {e}")
         return None
@@ -70,23 +91,22 @@ def determine_bond_type(nm):
         return 'BW'
     return '-'
 
-def get_mezzanine_data(isin):
+def get_mezzanine_data(isin, corp_name):
     print(f"\n{'='*50}")
-    print(f"  🔍 조회 중: {isin}")
+    print(f"  🔍 조회 중: {isin} ({corp_name})")
 
     hosu      = '-'
     bond_type = '-'
     xrc_price = '0'
     issu_dt   = '-'
 
-    # ── 1) 기본정보: 발행일 + 종목명(회차, 종류) ─────
+    # ── 1) 발행일 ─────────────────────────────────────
     root = seibro_call('intPayInfoView', isin)
     if root is not None:
         issu_dt = format_date(root.findtext('.//ISSU_DT', ''))
         print(f"  📅 발행일: {issu_dt}")
 
-    # 종목명은 검색창에 입력된 값(A열 종목명)으로 판단하기 어려우므로
-    # SEIBRO 종목요약정보에서 KOR_SECN_NM 가져오기
+    # ── 2) 종목명 → 회차, 종류 ─────────────────────────
     root2 = seibro_call('bondBasiInfoView', isin)
     if root2 is not None:
         secn_nm = (
@@ -94,24 +114,24 @@ def get_mezzanine_data(isin):
             root2.findtext('.//SECN_NM', '') or
             root2.findtext('.//BOND_NM', '')
         )
-        print(f"  📌 종목명 응답: {secn_nm}")
+        print(f"  📌 종목명: {secn_nm}")
         if secn_nm:
             hosu = extract_hosu(secn_nm)
             bond_type = determine_bond_type(secn_nm)
-    else:
-        print(f"  ⚠ bondBasiInfoView 응답 없음, 종목명 직접 파싱 시도")
 
-    # bondBasiInfoView가 안 되면 A열 종목명 + 스프레드시트 데이터 활용
-    # (main에서 corp_name 넘겨주는 방식으로 보완)
+    # bondBasiInfoView 실패 시 A열 종목명으로 보완
+    if bond_type == '-':
+        bond_type = determine_bond_type(corp_name)
+    if hosu == '-':
+        hosu = extract_hosu(corp_name)
 
-    # ── 2) 주식관련옵션: 행사가격 ────────────────────
+    # ── 3) 행사가격 ────────────────────────────────────
     root = seibro_call('exerDetailListCnt', isin)
     if root is not None:
         item = root.find('.//result')
         if item is not None:
             xrc_price = item.findtext('XRC_PRICE', '0').replace(',', '')
-            kor_nm = item.findtext('KOR_SECN_NM', '')
-            print(f"  💰 행사가격: {xrc_price}, 대상주식: {kor_nm}")
+            print(f"  💰 행사가격: {xrc_price}")
 
     result = [hosu, bond_type, xrc_price, issu_dt, '-']
     print(f"  ✅ 최종 결과: {result}")
@@ -136,18 +156,8 @@ async def main():
 
     for sheet_row, row in data_rows:
         isin      = row[1].strip()
-        corp_name = row[0].strip()  # A열 종목명 (보조용)
-
-        result = get_mezzanine_data(isin)
-
-        # bondBasiInfoView 실패 시 A열 종목명으로 보완
-        if result[0] == '-' or result[1] == '-':
-            print(f"  🔄 A열 종목명으로 보완: {corp_name}")
-            if result[1] == '-':
-                result[1] = determine_bond_type(corp_name)
-            if result[0] == '-':
-                result[0] = extract_hosu(corp_name)
-
+        corp_name = row[0].strip()
+        result = get_mezzanine_data(isin, corp_name)
         batch_updates.append(result)
         await asyncio.sleep(1.5)
 
