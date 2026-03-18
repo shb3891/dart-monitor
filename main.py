@@ -13,7 +13,7 @@ from datetime import datetime
 DART_API_KEY = 'bfc4e4e445de4727ae0bcc27e80ba5cf0e3818e6'
 TELEGRAM_TOKEN = '8491277145:AAHwHfaG1q-5ZjExFu8o3T9T6X5c8HlLSlI'
 CHAT_ID = '536635522'
-SHEET_ID = '1s73BDNtCPe5mOs9EjBE5npEfcaNtYRyWJxRBUmJI-WA' # 과장님 기존 시트 ID
+SHEET_ID = '1s73BDNtCPe5mOs9EjBE5npEfcaNtYRyWJxRBUmJI-WA'
 
 # 구글 시트 연결 설정
 creds_json = json.loads(os.environ.get('GCP_SERVICE_ACCOUNT_KEY'))
@@ -45,8 +45,6 @@ async def update_sheet(stock_name, report, row_idx):
     """시트에 공시 날짜와 링크를 업데이트합니다."""
     try:
         m_info = extract_mezzanine_info(report)
-        
-        # D열(4): 날짜, E열(5): 링크, F열(6): 행사가액 업데이트
         worksheet.update_cell(row_idx, 4, report.rcept_dt)
         worksheet.update_cell(row_idx, 5, f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={report.rcept_no}")
         if m_info["행사가액"]:
@@ -57,19 +55,46 @@ async def update_sheet(stock_name, report, row_idx):
 
 async def main():
     bot = Bot(token=TELEGRAM_TOKEN)
-    # 시트 데이터 전체 가져오기 (헤더 포함)
     all_values = worksheet.get_all_values()
     if not all_values: return
     
     header = all_values[0]
     rows = all_values[1:]
     
-    # '종목명'과 '링크' 컬럼 위치 파악 (중복 방지용)
     try:
         name_col_idx = header.index("종목명")
-        link_col_idx = 4 # E열 (Index 4)
+        link_col_idx = 4 # E열
     except ValueError:
         print("❌ '종목명' 컬럼을 찾을 수 없습니다.")
         return
 
-    print(f"🔍 실시간 감시 시작: {len(rows
+    print(f"🔍 실시간 감시 시작: {len(rows)}개 종목")
+
+    for i, row in enumerate(rows):
+        stock = row[name_col_idx]
+        if not stock: continue
+        
+        existing_link = row[link_col_idx] if len(row) > link_col_idx else ""
+        target = corp_list.find_by_corp_name(stock, exactly=True)
+        if not target: continue
+        
+        try:
+            today_str = datetime.now().strftime('%Y%m%d')
+            reports = target[0].search_filings(bgn_de=today_str)
+        except:
+            continue
+        
+        if not reports: continue
+        
+        for r in reports:
+            new_link = f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={r.rcept_no}"
+            if new_link == existing_link:
+                continue
+            
+            msg = f"🔔 [새 공시] {stock}\n📄 {r.report_nm}\n🔗 {new_link}"
+            await bot.send_message(chat_id=CHAT_ID, text=msg)
+            await update_sheet(stock, r, i + 2)
+            await asyncio.sleep(1)
+
+if __name__ == "__main__":
+    asyncio.run(main())
