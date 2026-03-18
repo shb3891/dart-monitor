@@ -1,14 +1,14 @@
-import dart_fss as dart
 import asyncio
 import os
 import json
 import gspread
-import re
+import requests
+import xml.etree.ElementTree as ET
 from google.oauth2.service_account import Credentials
-from datetime import datetime, timedelta
 
 # --- 설정 정보 ---
-DART_API_KEY = 'bfc4e4e445de4727ae0bcc27e80ba5cf0e3818e6'
+# 방금 주신 SEibro 서비스키 (Decoding 키 권장)
+SERVICE_KEY = '040c722e03bd9f412852134b7984002f9aaab072aebb672ec28d0792cc996a34'
 SHEET_ID = '1s73BDNtCPe5mOs9EjBE5npEfcaNtYRyWJxRBUmJI-WA'
 
 creds_json = json.loads(os.environ.get('GCP_SERVICE_ACCOUNT_KEY'))
@@ -18,89 +18,74 @@ gc = gspread.authorize(creds)
 sh = gc.open_by_key(SHEET_ID)
 worksheet = sh.get_worksheet(0)
 
-dart.set_api_key(api_key=DART_API_KEY)
-corp_list = dart.get_corp_list()
-
-def find_mezzanine_info(report):
-    """공시 본문을 분석하여 회차, 종류, 행사가액을 추출합니다."""
+def get_seibro_bond_info(isin_code):
+    """SEibro 채권기본정보조회 API 호출"""
+    url = "http://api.seibro.or.kr/openapi/service/BondSvc/getBondIssuInfo"
+    params = {
+        'serviceKey': SERVICE_KEY,
+        'isin': isin_code,
+        'numOfRows': '1',
+        'pageNo': '1'
+    }
+    
     try:
-        # 공시 제목에서 회차와 종류 1차 추출 (가장 정확함)
-        # 예: 주요사항보고서(전환사채권발행결정)
-        title = report.report_nm
-        m_type = "CB" if "전환사채" in title else ("BW" if "신주인수권" in title else ("EB" if "교환사채" in title else ""))
-        
-        tables = report.extract_tables()
-        for table in tables:
-            df = table.to_df()
-            text = df.to_string().replace(" ", "")
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            root = ET.fromstring(response.text)
+            item = root.find('.//item')
             
-            # 본문 내 '제 N회' 검색
-            round_match = re.search(r'제?\s*(\d+)\s*회', text)
-            # 행사가액 검색
-            price_match = re.search(r'([\d,]{4,})원', text)
-            # 권리청구 시작일 검색
-            date_match = re.findall(r'20\d{2}[\.\-\/]\d{2}[\.\-\/]\d{2}', text)
-            
-            if round_match or price_match:
+            if item is not None:
+                # 1. 발행명칭 (예: 성호전자 2회 전환사채)
+                bond_nm = item.findtext('bondIssuNm', '')
+                
+                # 2. 회차 및 종류 판별
+                import re
+                round_match = re.search(r'(\d+)회', bond_nm)
+                round_val = round_match.group(1) if round_match else "1"
+                
+                b_type = "CB" if "전환" in bond_nm else ("BW" if "신주" in bond_nm else ("EB" if "교환" in bond_nm else "채권"))
+                
+                # 3. 발행일/상장일 등 날짜 (필요시 추가)
+                issu_dt = item.findtext('issuDt', '') # 발행일
+                
                 return {
-                    "회차": round_match.group(1) if round_match else "1",
-                    "종류": m_type if m_type else "CB",
-                    "가격": price_match.group(1) if price_match else "",
-                    "날짜": sorted(date_match)[0] if date_match else ""
+                    "회차": round_val,
+                    "종류": b_type,
+                    "명칭": bond_nm,
+                    "발행일": issu_dt
                 }
-        return None
-    except:
-        return None
+    except Exception as e:
+        print(f"      ⚠️ {isin_code} 조회 실패: {e}")
+    return None
 
 async def main():
     all_values = worksheet.get_all_values()
     if not all_values: return
     
     rows = all_values[1:]
-    # 최근 3년 공시 대상
-    bgn_de = (datetime.now() - timedelta(days=1100)).strftime('%Y%m%d')
-
-    print(f"🚀 [DART 전용 모드] {len(rows)}개 종목 분석 시작")
+    print(f"🚀 [SEibro 마스터 모드] {len(rows)}개 종목 업데이트 시작")
 
     for i, row in enumerate(rows):
-        stock_name = row[0].strip() # A열 종목명
-        if not stock_name: continue
+        isin_code = row[1].strip() # B열 ISIN 코드
+        if not isin_code or not isin_code.startswith('KR'): continue
         
-        print(f"🔍 [{i+1}/{len(rows)}] {stock_name} 공시 분석 중...")
+        print(f"🔍 [{i+1}/{len(rows)}] {isin_code} 조회 중...")
         
-        try:
-            corp = corp_list.find_by_corp_name(stock_name, exactly=True)
-            if not corp:
-                corp = corp_list.find_by_corp_name(stock_name, exactly=False)
-            
-            if not corp: continue
-
-            # '발행결정' 관련 공시만 필터링해서 검색 (이게 핵심입니다)
-            reports = corp[0].search_filings(bgn_de=bgn_de, p_kind='B')
-            
-            success = False
-            for r in reports:
-                if "발행결정" in r.report_nm:
-                    data = find_mezzanine_info(r)
-                    if data:
-                        row_idx = i + 2
-                        # 데이터 일괄 업데이트 (C, D, E, F열)
-                        worksheet.update(f"C{row_idx}:F{row_idx}", [[data["회차"], data["종류"], data["가격"], data["날짜"]]])
-                        print(f"   ✅ {stock_name} 입력 성공! (제{data['회차']}회 {data['종류']})")
-                        success = True
-                        break
-            
-            if not success:
-                print(f"   - 발행공시를 찾지 못했습니다.")
-
-        except Exception as e:
-            if "429" in str(e):
-                print("⚠️ 시트 제한 발생! 10초 대기...")
+        data = get_seibro_bond_info(isin_code)
+        
+        if data:
+            row_idx = i + 2
+            # C, D열 (회차, 종류) 업데이트
+            # E, F열(가격, 날짜)은 채권정보 외에 '행사가액' 전용 API가 필요할 수 있으나 우선 기본정보부터 채웁니다.
+            try:
+                worksheet.update(f"C{row_idx}:D{row_idx}", [[data["회차"], data["종류"]]])
+                print(f"   ✅ {data['명칭']} 업데이트 완료")
+            except Exception as e:
+                print(f"   ⚠️ 시트 쓰기 지연 (10초 대기): {e}")
                 await asyncio.sleep(10)
-            else:
-                print(f"   - 에러: {e}")
-            
-        await asyncio.sleep(2) # 안전한 속도 유지
+        
+        # API 및 구글 시트 할당량 보호 (초당 1건 정도)
+        await asyncio.sleep(1.2)
 
 if __name__ == "__main__":
     asyncio.run(main())
