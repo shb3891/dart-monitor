@@ -8,7 +8,7 @@ import re
 from google.oauth2.service_account import Credentials
 
 # --- [설정] ---
-SHEET_ID = '1s73BDNtCPe5mOs9EjBUmJI-WA'
+SHEET_ID = '1s73BDNtCPe5mOs9EjBE5npEfcaNtYRyWJxRBUmJI-WA'
 
 creds_json = json.loads(os.environ.get('GCP_SERVICE_ACCOUNT_KEY'))
 scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
@@ -31,8 +31,9 @@ SESSION.headers.update({
     'X-Requested-With': 'XMLHttpRequest',
 })
 
-def seibro_call(action, isin):
-    payload = f'<reqParam action="{action}" task="{TASK}"><ISIN value="{isin}"/><PAGE_ON_CNT value="100"/><PAGE_NUM value="1"/></reqParam>'
+def seibro_call(action, isin, extra_params=""):
+    """SEIBRO callServletService.jsp 호출."""
+    payload = f'<reqParam action="{action}" task="{TASK}"><ISIN value="{isin}"/>{extra_params}</reqParam>'
     try:
         r = SESSION.post(
             SEIBRO_URL,
@@ -41,16 +42,14 @@ def seibro_call(action, isin):
         )
         r.raise_for_status()
 
-        # ✅ 핵심: EUC-KR 디코딩 후 XML 선언부 제거
+        # EUC-KR 디코딩 후 XML 선언부 제거
         try:
             decoded = r.content.decode('euc-kr', errors='replace')
         except Exception:
             decoded = r.content.decode('utf-8', errors='replace')
 
-        # XML 선언부 제거 (인코딩 충돌 방지)
         cleaned = re.sub(r'<\?xml[^?]*\?>', '', decoded).strip()
 
-        # HTML 에러페이지 체크
         if '<!DOCTYPE' in cleaned or '<html' in cleaned.lower():
             print(f"  ❌ HTML 에러페이지 [{action}]")
             print(f"  📄 Raw: {cleaned[:200]}")
@@ -100,33 +99,52 @@ def get_mezzanine_data(isin, corp_name):
     xrc_price = '0'
     issu_dt   = '-'
 
-    # ── 1) 발행일 ─────────────────────────────────────
-    root = seibro_call('intPayInfoView', isin)
+    # ── 1) issuInfoViewEL1: 종목명(회차/종류) + 발행일 ──
+    root = seibro_call('issuInfoViewEL1', isin)
     if root is not None:
-        issu_dt = format_date(root.findtext('.//ISSU_DT', ''))
-        print(f"  📅 발행일: {issu_dt}")
+        # 전체 필드 출력 (디버깅용)
+        print(f"  📋 issuInfoViewEL1 필드:")
+        for el in root.iter():
+            if el.text and el.text.strip():
+                print(f"      {el.tag}: {el.text.strip()}")
 
-    # ── 2) 종목명 → 회차, 종류 ─────────────────────────
-    root2 = seibro_call('bondBasiInfoView', isin)
-    if root2 is not None:
-        secn_nm = (
-            root2.findtext('.//KOR_SECN_NM', '') or
-            root2.findtext('.//SECN_NM', '') or
-            root2.findtext('.//BOND_NM', '')
+        # 발행일
+        issu_dt = format_date(
+            root.findtext('.//ISSU_DT', '') or
+            root.findtext('.//ISS_DT', '')
         )
-        print(f"  📌 종목명: {secn_nm}")
+
+        # 종목명
+        secn_nm = (
+            root.findtext('.//KOR_SECN_NM', '') or
+            root.findtext('.//SECN_NM', '') or
+            root.findtext('.//BOND_NM', '') or
+            root.findtext('.//BOND_ISSU_NM', '')
+        )
+        print(f"  📌 종목명: {secn_nm} | 발행일: {issu_dt}")
+
         if secn_nm:
             hosu = extract_hosu(secn_nm)
             bond_type = determine_bond_type(secn_nm)
 
-    # bondBasiInfoView 실패 시 A열 종목명으로 보완
+    # ── 2) intPayInfoView: 발행일 보완용 ────────────────
+    if issu_dt == '-':
+        root2 = seibro_call('intPayInfoView', isin)
+        if root2 is not None:
+            issu_dt = format_date(root2.findtext('.//ISSU_DT', ''))
+            print(f"  📅 발행일(intPayInfoView): {issu_dt}")
+
+    # issuInfoViewEL1 실패 시 A열 종목명으로 보완
     if bond_type == '-':
         bond_type = determine_bond_type(corp_name)
+        print(f"  🔄 종류 보완(A열): {bond_type}")
     if hosu == '-':
         hosu = extract_hosu(corp_name)
+        print(f"  🔄 회차 보완(A열): {hosu}")
 
-    # ── 3) 행사가격 ────────────────────────────────────
-    root = seibro_call('exerDetailListCnt', isin)
+    # ── 3) exerDetailListCnt: 행사가격 ─────────────────
+    root = seibro_call('exerDetailListCnt', isin,
+                       extra_params='<PAGE_ON_CNT value="100"/><PAGE_NUM value="1"/>')
     if root is not None:
         item = root.find('.//result')
         if item is not None:
