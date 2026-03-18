@@ -43,7 +43,7 @@ def init_session():
             'X-Requested-With': 'XMLHttpRequest',
             'Accept': 'application/xml, text/xml, */*',
         })
-        print(f"✅ 세션 초기화 완료")
+        print("✅ 세션 초기화 완료")
         return True
     except Exception as e:
         print(f"❌ 세션 초기화 실패: {e}")
@@ -76,7 +76,7 @@ def seibro_call(action, isin, extra_params=""):
         return None
 
 def get_attr(element, tag):
-    """✅ attribute 방식 XML 파싱: <TAG value="..."/> → 값 반환"""
+    """attribute 방식 XML 파싱: <TAG value="..."/> → 값 반환"""
     el = element.find(f'.//{tag}')
     if el is not None:
         return el.get('value', '')
@@ -101,41 +101,44 @@ def get_mezzanine_data(isin, corp_name):
     print(f"  🔍 조회 중: {isin} ({corp_name})")
 
     hosu      = '-'
-    bond_type = '-'
+    bond_type = ''
     xrc_price = '0'
     issu_dt   = '-'
 
     # ── 1) issuInfoViewEL1: 종목명 + 발행일 + 종류 ───
     root = seibro_call('issuInfoViewEL1', isin)
     if root is not None:
-        secn_nm   = get_attr(root, 'KOR_SECN_NM')
-        issu_dt   = format_date(get_attr(root, 'ISSU_DT'))
-        bond_type = get_attr(root, 'PARTICUL_BOND_KIND')  # EB/CB/BW 직접!
+        result_el = root.find('.//result')
+        if result_el is not None:
+            secn_nm   = get_attr(result_el, 'KOR_SECN_NM')
+            issu_dt   = format_date(get_attr(result_el, 'ISSU_DT'))
+            bond_type = get_attr(result_el, 'PARTICUL_BOND_KIND')
 
-        print(f"  📌 종목명: {secn_nm}")
-        print(f"  📅 발행일: {issu_dt}")
-        print(f"  🏷 종류: {bond_type}")
+            print(f"  📌 종목명: {secn_nm}")
+            print(f"  📅 발행일: {issu_dt}")
+            print(f"  🏷 종류: {bond_type}")
 
-        hosu = extract_hosu(secn_nm)
-        print(f"  🔢 회차: {hosu}")
+            hosu = extract_hosu(secn_nm)
+            print(f"  🔢 회차: {hosu}")
 
-    # 보완: PARTICUL_BOND_KIND 없을 경우 종목명으로 판단
-    if not bond_type or bond_type == '-':
-        nm = get_attr(root, 'KOR_SECN_NM') if root else corp_name
-        if 'EB' in nm or '교환' in nm:
-            bond_type = 'EB'
-        elif 'CB' in nm or '전환' in nm:
-            bond_type = 'CB'
-        elif 'BW' in nm or '신주인수' in nm:
-            bond_type = 'BW'
+            # 종류 보완
+            if not bond_type:
+                if 'EB' in secn_nm or '교환' in secn_nm:
+                    bond_type = 'EB'
+                elif 'CB' in secn_nm or '전환' in secn_nm:
+                    bond_type = 'CB'
+                elif 'BW' in secn_nm or '신주인수' in secn_nm:
+                    bond_type = 'BW'
+        else:
+            print(f"  ⚠ result 엘리먼트 없음")
 
     # ── 2) exerDetailListCnt: 행사가격 ────────────────
     root2 = seibro_call('exerDetailListCnt', isin,
                         extra_params='<PAGE_ON_CNT value="100"/><PAGE_NUM value="1"/>')
     if root2 is not None:
-        result_el = root2.find('.//result')
-        if result_el is not None:
-            xrc_price = get_attr(result_el, 'XRC_PRICE').replace(',', '')
+        result_el2 = root2.find('.//result')
+        if result_el2 is not None:
+            xrc_price = get_attr(result_el2, 'XRC_PRICE').replace(',', '')
             print(f"  💰 행사가격: {xrc_price}")
 
     result = [hosu, bond_type, xrc_price, issu_dt, '-']
