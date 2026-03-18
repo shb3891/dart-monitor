@@ -28,7 +28,11 @@ def xml_get(isin, endpoint, extra_params=None):
     try:
         r = requests.get(f"{BASE_URL}/{endpoint}", params=params, timeout=10)
         r.raise_for_status()
-        root = ET.fromstring(r.content)
+
+        # ✅ SEIBRO는 EUC-KR 인코딩으로 응답 → UTF-8로 변환 후 파싱
+        r.encoding = 'euc-kr'
+        xml_text = r.text.encode('utf-8')
+        root = ET.fromstring(xml_text)
 
         result_code = root.findtext('.//resultCode', '')
         if result_code not in ('', '00', '000'):
@@ -38,6 +42,7 @@ def xml_get(isin, endpoint, extra_params=None):
 
         item = root.find('.//item')
         return item
+
     except requests.exceptions.Timeout:
         print(f"  ⏱ Timeout [{isin}] {endpoint}")
         return None
@@ -84,11 +89,11 @@ def get_mezzanine_data(isin):
         print(f"  ❌ 기본정보 없음: {isin}")
         return ['-', '-', '0', '-', '-']
 
-    bond_nm  = item.findtext('bondIssuNm', '') or item.findtext('bondNm', '')
-    issu_dt  = item.findtext('issuDt', '') or item.findtext('bondIssuDt', '')
+    bond_nm     = item.findtext('bondIssuNm', '') or item.findtext('bondNm', '')
+    issu_dt     = item.findtext('issuDt', '') or item.findtext('bondIssuDt', '')
 
-    hosu      = extract_hosu(bond_nm)
-    bond_type = determine_bond_type(bond_nm)
+    hosu        = extract_hosu(bond_nm)
+    bond_type   = determine_bond_type(bond_nm)
     issu_dt_fmt = format_date(issu_dt)
 
     exercise_price = '0'
@@ -105,18 +110,21 @@ def get_mezzanine_data(isin):
         detail = xml_get(isin, detail_endpoint)
 
         if detail is not None:
+            # 행사가액 필드 순서대로 시도
             for field in ['convPrcNow', 'convPrice', 'exchPrc', 'wrantExrcPrc', 'issuConvPrice']:
                 val = detail.findtext(field, '')
                 if val and val.strip() not in ('', '0', '-'):
                     exercise_price = val.strip().replace(',', '')
                     break
 
+            # 권리청구 시작일 필드 순서대로 시도
             for field in ['convAplcStrtDt', 'exchAplcStrtDt', 'wrantExrcStrtDt', 'rightStrtDt']:
                 val = detail.findtext(field, '')
                 if val and val.strip() not in ('', '-'):
                     right_start_dt = format_date(val.strip())
                     break
 
+    # 행사가액이 여전히 0이면 기본정보에서 재시도
     if exercise_price == '0':
         for field in ['issuConvPrice', 'convPrc', 'exchPrc']:
             val = item.findtext(field, '')
@@ -147,7 +155,7 @@ async def main():
         isin = row[1].strip()
         result = get_mezzanine_data(isin)
         batch_updates.append(result)
-        await asyncio.sleep(1.2)
+        await asyncio.sleep(1.2)  # API 호출 간격
 
     if batch_updates:
         end_row = start_row + len(batch_updates) - 1
