@@ -21,23 +21,17 @@ worksheet = sh.get_worksheet(0)
 TEST_MODE = True
 TEST_LIMIT = 3
 
-# ✅ https로 변경
 BASE_URL = "https://seibro.or.kr/OpenPlatform/callOpenAPI.jsp"
 
 def seibro_api(api_id, params_dict):
     params_str = ','.join([f"{k}:{v}" for k, v in params_dict.items()])
     full_url = f"{BASE_URL}?key={SEIBRO_KEY}&apiId={api_id}&params={params_str}"
-    print(f"  🌐 호출 URL: {full_url}")
     try:
         r = requests.get(full_url, timeout=10)
         r.raise_for_status()
 
-        try:
-            decoded = r.content.decode('euc-kr', errors='replace')
-        except Exception:
-            decoded = r.content.decode('utf-8', errors='replace')
-
-        print(f"  📡 응답 앞 300자: {decoded[:300]}")
+        # ✅ UTF-8로 디코딩 (한글 깨짐 해결)
+        decoded = r.content.decode('utf-8', errors='replace')
 
         cleaned = re.sub(r'<\?xml[^?]*\?>', '', decoded).strip()
         if not cleaned:
@@ -47,7 +41,6 @@ def seibro_api(api_id, params_dict):
 
         vector = root.find('.//vector')
         if vector is None:
-            print(f"  ⚠ [{api_id}] vector 없음")
             return None
 
         result_count = vector.get('result', '0')
@@ -82,7 +75,7 @@ def extract_hosu(nm):
         return m.group(1)
     return '-'
 
-def determine_bond_type(kind_tpcd, secn_nm):
+def determine_bond_type(secn_nm):
     nm = secn_nm or ''
     if 'EB' in nm or '교환' in nm:
         return 'EB'
@@ -90,12 +83,11 @@ def determine_bond_type(kind_tpcd, secn_nm):
         return 'CB'
     if 'BW' in nm or '신주인수' in nm:
         return 'BW'
-    code_map = {'1': 'CB', '2': 'EB', '3': 'BW'}
-    return code_map.get(kind_tpcd, '-')
+    return '-'
 
-def get_mezzanine_data(isin):
+def get_mezzanine_data(isin, corp_name):
     print(f"\n{'='*50}")
-    print(f"  🔍 조회 중: {isin}")
+    print(f"  🔍 조회 중: {isin} ({corp_name})")
 
     hosu           = '-'
     bond_type      = '-'
@@ -103,36 +95,28 @@ def get_mezzanine_data(isin):
     issu_dt        = '-'
     right_start_dt = '-'
 
-    # ── 1) getBondStatInfo: 종목명, 발행일, 종류 ──────
+    # ── 1) getBondStatInfo: 발행일, 종류 ─────────────
     root = seibro_api('getBondStatInfo', {'ISIN': isin})
     if root is not None:
         result_el = root.find('.//result')
         if result_el is not None:
             secn_nm   = get_attr(result_el, 'KOR_SECN_NM')
             issu_dt   = format_date(get_attr(result_el, 'ISSU_DT'))
-            bond_kind = get_attr(result_el, 'PARTICUL_BOND_KIND_TPCD')
-            bond_type = determine_bond_type(bond_kind, secn_nm)
-            hosu      = extract_hosu(secn_nm)
+            bond_type = determine_bond_type(secn_nm)
 
-            print(f"  📌 종목명: {secn_nm}")
+            # 회차: API 종목명에서 못 찾으면 A열 종목명으로 보완
+            hosu = extract_hosu(secn_nm)
+            if hosu == '-':
+                hosu = extract_hosu(corp_name)
+
+            print(f"  📌 종목명(API): {secn_nm}")
             print(f"  📅 발행일: {issu_dt}")
             print(f"  🏷 종류: {bond_type}")
             print(f"  🔢 회차: {hosu}")
-
-    # ── 2) getBondOptionXrcInfo: 권리청구시작일 ───────
-    root2 = seibro_api('getBondOptionXrcInfo', {'ISIN': isin})
-    if root2 is not None:
-        items = root2.findall('.//result')
-        earliest = None
-        for item in items:
-            option_cd = get_attr(item, 'OPTION_TPCD')
-            xrc_begin = get_attr(item, 'XRC_BEGIN_DT')
-            if option_cd != '9402' and xrc_begin and xrc_begin.strip():
-                if earliest is None or xrc_begin < earliest:
-                    earliest = xrc_begin
-        if earliest:
-            right_start_dt = format_date(earliest)
-            print(f"  📅 권리청구시작일: {right_start_dt}")
+    else:
+        # API 실패 시 A열 종목명으로 보완
+        bond_type = determine_bond_type(corp_name)
+        hosu = extract_hosu(corp_name)
 
     result = [hosu, bond_type, xrc_price, issu_dt, right_start_dt]
     print(f"  ✅ 최종 결과: {result}")
@@ -156,8 +140,9 @@ async def main():
     start_row = data_rows[0][0] if data_rows else 2
 
     for sheet_row, row in data_rows:
-        isin = row[1].strip()
-        result = get_mezzanine_data(isin)
+        isin      = row[1].strip()
+        corp_name = row[0].strip()
+        result = get_mezzanine_data(isin, corp_name)
         batch_updates.append(result)
         await asyncio.sleep(1.0)
 
@@ -165,7 +150,7 @@ async def main():
         end_row = start_row + len(batch_updates) - 1
         range_str = f"C{start_row}:G{end_row}"
         worksheet.update(range_str, batch_updates)
-        print(f"\n🏁 완료! {len(batch_updates)}개 종목 → {range_str} 업데이트됨")
+        print(f"\n🏁 완료! 3개 종목 → {range_str} 업데이트됨")
 
 if __name__ == "__main__":
     asyncio.run(main())
