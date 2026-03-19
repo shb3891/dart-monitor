@@ -19,36 +19,58 @@ sh = gc.open_by_key(SHEET_ID)
 worksheet = sh.get_worksheet(0)
 
 TEST_MODE = True
-TEST_LIMIT = 1
+TEST_LIMIT = 3
 
 BASE_URL = "http://seibro.or.kr/OpenPlatform/callOpenAPI.jsp"
 
-def seibro_api(api_name, params):
+# 특이채권종류코드 → CB/EB/BW 매핑
+BOND_TYPE_MAP = {
+    '1': 'CB',   # 전환사채
+    '2': 'BW',   # 신주인수권부사채
+    '3': 'EB',   # 교환사채
+    '4': 'CB',   # 주가연계사채
+}
+
+def seibro_api(api_id, params_dict):
     """SEIBRO 오픈플랫폼 API 호출."""
-    params['key'] = SEIBRO_KEY
-    params['apiId'] = api_name
+    params_str = ','.join([f"{k}:{v}" for k, v in params_dict.items()])
     try:
-        r = requests.get(BASE_URL, params=params, timeout=10)
+        r = requests.get(
+            BASE_URL,
+            params={'key': SEIBRO_KEY, 'apiId': api_id, 'params': params_str},
+            timeout=10
+        )
         r.raise_for_status()
 
-        # 인코딩 처리
         try:
             decoded = r.content.decode('euc-kr', errors='replace')
         except Exception:
             decoded = r.content.decode('utf-8', errors='replace')
 
-        print(f"  📡 [{api_name}] 응답 (앞 500자):")
-        print(decoded[:500])
-
         cleaned = re.sub(r'<\?xml[^?]*\?>', '', decoded).strip()
         if not cleaned:
             return None
 
-        return ET.fromstring(cleaned.encode('utf-8'))
+        root = ET.fromstring(cleaned.encode('utf-8'))
+
+        # 결과 확인
+        result_count = root.get('result', '0')
+        if result_count == '0':
+            print(f"  ⚠ [{api_id}] 결과 없음")
+            return None
+
+        return root
 
     except Exception as e:
-        print(f"  ⚠ API 호출 실패 [{api_name}]: {e}")
+        print(f"  ⚠ API 호출 실패 [{api_id}]: {e}")
         return None
+
+def get_attr(element, tag):
+    """attribute 방식 XML 파싱: <TAG value="..."/> → 값 반환"""
+    el = element.find(f'.//{tag}')
+    if el is not None:
+        return el.get('value', '')
+    return ''
 
 def format_date(raw):
     raw = str(raw).strip() if raw else ''
@@ -73,18 +95,51 @@ def get_mezzanine_data(isin):
     bond_type = '-'
     xrc_price = '0'
     issu_dt   = '-'
+    right_start_dt = '-'
 
     # ── 1) getBondStatInfo: 종목명, 발행일, 종류 ──────
     root = seibro_api('getBondStatInfo', {'ISIN': isin})
     if root is not None:
-        # 실제 필드명 확인용 전체 출력
-        for el in root.iter():
-            if el.text and el.text.strip():
-                print(f"      {el.tag}: {el.text.strip()}")
-            for k, v in el.attrib.items():
-                print(f"      {el.tag}[{k}]: {v}")
+        result_el = root.find('.//result')
+        if result_el is not None:
+            secn_nm     = get_attr(result_el, 'KOR_SECN_NM')
+            issu_dt     = format_date(get_attr(result_el, 'ISSU_DT'))
+            bond_kind   = get_attr(result_el, 'PARTICUL_BOND_KIND_TPCD')
+            bond_type   = BOND_TYPE_MAP.get(bond_kind, '-')
+            hosu        = extract_hosu(secn_nm)
 
-    result = [hosu, bond_type, xrc_price, issu_dt, '-']
+            print(f"  📌 종목명: {secn_nm}")
+            print(f"  📅 발행일: {issu_dt}")
+            print(f"  🏷 종류코드: {bond_kind} → {bond_type}")
+            print(f"  🔢 회차: {hosu}")
+
+            # 종류 보완: PARTICUL_BOND_KIND_TPCD로 안 잡히면 종목명으로
+            if bond_type == '-':
+                if 'EB' in secn_nm or '교환' in secn_nm:
+                    bond_type = 'EB'
+                elif 'CB' in secn_nm or '전환' in secn_nm:
+                    bond_type = 'CB'
+                elif 'BW' in secn_nm or '신주인수' in secn_nm:
+                    bond_type = 'BW'
+
+    # ── 2) getBondOptionXrcInfo: 권리청구시작일 ───────
+    # PUT 제외하고 가장 빠른 행사시작일 찾기
+    root2 = seibro_api('getBondOptionXrcInfo', {'ISIN': isin})
+    if root2 is not None:
+        items = root2.findall('.//result')
+        earliest = None
+        for item in items:
+            option_cd = get_attr(item, 'OPTION_TPCD')
+            xrc_begin = get_attr(item, 'XRC_BEGIN_DT')
+            # 9401=CALL, 9402=PUT — PUT 제외
+            if option_cd != '9402' and xrc_begin and xrc_begin.strip():
+                if earliest is None or xrc_begin < earliest:
+                    earliest = xrc_begin
+        if earliest:
+            right_start_dt = format_date(earliest)
+            print(f"  📅 권리청구시작일: {right_start_dt}")
+
+    result = [hosu, bond_type, xrc_price, issu_dt, right_start_dt]
     print(f"  ✅ 최종 결과: {result}")
     return result
 
