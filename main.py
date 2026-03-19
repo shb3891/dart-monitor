@@ -38,13 +38,16 @@ def seibro_api(api_id, params_dict):
         except Exception:
             decoded = r.content.decode('utf-8', errors='replace')
 
+        # ✅ 디버깅: 실제 응답 출력
+        print(f"  📡 [{api_id}] 실제 응답:")
+        print(decoded[:800])
+
         cleaned = re.sub(r'<\?xml[^?]*\?>', '', decoded).strip()
         if not cleaned:
             return None
 
         root = ET.fromstring(cleaned.encode('utf-8'))
 
-        # ✅ <SeibroAPI> 아래 <vector>에서 result 확인
         vector = root.find('.//vector')
         if vector is None:
             print(f"  ⚠ [{api_id}] vector 없음")
@@ -83,8 +86,6 @@ def extract_hosu(nm):
     return '-'
 
 def determine_bond_type(kind_tpcd, secn_nm):
-    """PARTICUL_BOND_KIND_TPCD 코드 + 종목명으로 CB/EB/BW 판단."""
-    # 종목명 우선 판단 (더 정확)
     nm = secn_nm or ''
     if 'EB' in nm or '교환' in nm:
         return 'EB'
@@ -92,7 +93,6 @@ def determine_bond_type(kind_tpcd, secn_nm):
         return 'CB'
     if 'BW' in nm or '신주인수' in nm:
         return 'BW'
-    # 코드로 보완
     code_map = {'1': 'CB', '2': 'EB', '3': 'BW'}
     return code_map.get(kind_tpcd, '-')
 
@@ -128,9 +128,8 @@ def get_mezzanine_data(isin):
         items = root2.findall('.//result')
         earliest = None
         for item in items:
-            option_cd  = get_attr(item, 'OPTION_TPCD')
-            xrc_begin  = get_attr(item, 'XRC_BEGIN_DT')
-            # 9402=PUT 제외, 행사시작일 있는 것만
+            option_cd = get_attr(item, 'OPTION_TPCD')
+            xrc_begin = get_attr(item, 'XRC_BEGIN_DT')
             if option_cd != '9402' and xrc_begin and xrc_begin.strip():
                 if earliest is None or xrc_begin < earliest:
                     earliest = xrc_begin
