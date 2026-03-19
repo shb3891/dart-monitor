@@ -23,16 +23,7 @@ TEST_LIMIT = 3
 
 BASE_URL = "http://seibro.or.kr/OpenPlatform/callOpenAPI.jsp"
 
-# 특이채권종류코드 → CB/EB/BW 매핑
-BOND_TYPE_MAP = {
-    '1': 'CB',   # 전환사채
-    '2': 'BW',   # 신주인수권부사채
-    '3': 'EB',   # 교환사채
-    '4': 'CB',   # 주가연계사채
-}
-
 def seibro_api(api_id, params_dict):
-    """SEIBRO 오픈플랫폼 API 호출."""
     params_str = ','.join([f"{k}:{v}" for k, v in params_dict.items()])
     try:
         r = requests.get(
@@ -53,8 +44,13 @@ def seibro_api(api_id, params_dict):
 
         root = ET.fromstring(cleaned.encode('utf-8'))
 
-        # 결과 확인
-        result_count = root.get('result', '0')
+        # ✅ <SeibroAPI> 아래 <vector>에서 result 확인
+        vector = root.find('.//vector')
+        if vector is None:
+            print(f"  ⚠ [{api_id}] vector 없음")
+            return None
+
+        result_count = vector.get('result', '0')
         if result_count == '0':
             print(f"  ⚠ [{api_id}] 결과 없음")
             return None
@@ -66,7 +62,6 @@ def seibro_api(api_id, params_dict):
         return None
 
 def get_attr(element, tag):
-    """attribute 방식 XML 파싱: <TAG value="..."/> → 값 반환"""
     el = element.find(f'.//{tag}')
     if el is not None:
         return el.get('value', '')
@@ -87,14 +82,28 @@ def extract_hosu(nm):
         return m.group(1)
     return '-'
 
+def determine_bond_type(kind_tpcd, secn_nm):
+    """PARTICUL_BOND_KIND_TPCD 코드 + 종목명으로 CB/EB/BW 판단."""
+    # 종목명 우선 판단 (더 정확)
+    nm = secn_nm or ''
+    if 'EB' in nm or '교환' in nm:
+        return 'EB'
+    if 'CB' in nm or '전환' in nm:
+        return 'CB'
+    if 'BW' in nm or '신주인수' in nm:
+        return 'BW'
+    # 코드로 보완
+    code_map = {'1': 'CB', '2': 'EB', '3': 'BW'}
+    return code_map.get(kind_tpcd, '-')
+
 def get_mezzanine_data(isin):
     print(f"\n{'='*50}")
     print(f"  🔍 조회 중: {isin}")
 
-    hosu      = '-'
-    bond_type = '-'
-    xrc_price = '0'
-    issu_dt   = '-'
+    hosu           = '-'
+    bond_type      = '-'
+    xrc_price      = '0'
+    issu_dt        = '-'
     right_start_dt = '-'
 
     # ── 1) getBondStatInfo: 종목명, 발행일, 종류 ──────
@@ -102,36 +111,26 @@ def get_mezzanine_data(isin):
     if root is not None:
         result_el = root.find('.//result')
         if result_el is not None:
-            secn_nm     = get_attr(result_el, 'KOR_SECN_NM')
-            issu_dt     = format_date(get_attr(result_el, 'ISSU_DT'))
-            bond_kind   = get_attr(result_el, 'PARTICUL_BOND_KIND_TPCD')
-            bond_type   = BOND_TYPE_MAP.get(bond_kind, '-')
-            hosu        = extract_hosu(secn_nm)
+            secn_nm   = get_attr(result_el, 'KOR_SECN_NM')
+            issu_dt   = format_date(get_attr(result_el, 'ISSU_DT'))
+            bond_kind = get_attr(result_el, 'PARTICUL_BOND_KIND_TPCD')
+            bond_type = determine_bond_type(bond_kind, secn_nm)
+            hosu      = extract_hosu(secn_nm)
 
             print(f"  📌 종목명: {secn_nm}")
             print(f"  📅 발행일: {issu_dt}")
-            print(f"  🏷 종류코드: {bond_kind} → {bond_type}")
+            print(f"  🏷 종류: {bond_type}")
             print(f"  🔢 회차: {hosu}")
 
-            # 종류 보완: PARTICUL_BOND_KIND_TPCD로 안 잡히면 종목명으로
-            if bond_type == '-':
-                if 'EB' in secn_nm or '교환' in secn_nm:
-                    bond_type = 'EB'
-                elif 'CB' in secn_nm or '전환' in secn_nm:
-                    bond_type = 'CB'
-                elif 'BW' in secn_nm or '신주인수' in secn_nm:
-                    bond_type = 'BW'
-
     # ── 2) getBondOptionXrcInfo: 권리청구시작일 ───────
-    # PUT 제외하고 가장 빠른 행사시작일 찾기
     root2 = seibro_api('getBondOptionXrcInfo', {'ISIN': isin})
     if root2 is not None:
         items = root2.findall('.//result')
         earliest = None
         for item in items:
-            option_cd = get_attr(item, 'OPTION_TPCD')
-            xrc_begin = get_attr(item, 'XRC_BEGIN_DT')
-            # 9401=CALL, 9402=PUT — PUT 제외
+            option_cd  = get_attr(item, 'OPTION_TPCD')
+            xrc_begin  = get_attr(item, 'XRC_BEGIN_DT')
+            # 9402=PUT 제외, 행사시작일 있는 것만
             if option_cd != '9402' and xrc_begin and xrc_begin.strip():
                 if earliest is None or xrc_begin < earliest:
                     earliest = xrc_begin
