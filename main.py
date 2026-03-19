@@ -5,6 +5,7 @@ import gspread
 import requests
 import xml.etree.ElementTree as ET
 import re
+import time
 from google.oauth2.service_account import Credentials
 
 # --- [설정] ---
@@ -18,7 +19,7 @@ sh = gc.open_by_key(SHEET_ID)
 worksheet = sh.get_worksheet(0)
 
 TEST_MODE = True
-TEST_LIMIT = 1  # ✅ 일단 1개만
+TEST_LIMIT = 1
 
 SEIBRO_URL = "https://seibro.or.kr/websquare/engine/proworks/callServletService.jsp"
 TASK = "ksd.safe.bip.cnts.bone.process.BondSecnDetailPTask"
@@ -26,24 +27,44 @@ TASK = "ksd.safe.bip.cnts.bone.process.BondSecnDetailPTask"
 SESSION = requests.Session()
 SESSION.headers.update({
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     'Accept-Language': 'ko-KR,ko;q=0.9',
 })
 
 def init_session():
     print("🔐 SEIBRO 세션 초기화 중...")
     try:
+        # 1) 메인 페이지 접속
         SESSION.get(
             "https://seibro.or.kr/websquare/control.jsp?w2xPath=/IPORTAL/user/bond/BIP_CNTS03005V.xml",
             timeout=10
         )
+        time.sleep(1)
+
+        # 2) WebSquare 초기화
+        postfix = str(int(time.time() * 1000)) + str(time.time()).split('.')[1]
+        SESSION.get(
+            f"https://seibro.or.kr/websquare/websquare.js?w2xType=5&q=/IPORTAL/user/bond/BIP_CNTS03005V.xml&postfix={postfix}",
+            timeout=10
+        )
+        time.sleep(1)
+
+        # 3) processMsg 호출 (세션 활성화 핵심)
+        postfix2 = str(int(time.time() * 1000)) + str(time.time()).split('.')[1]
+        SESSION.get(
+            f"https://seibro.or.kr/IPORTAL/common/processMsg.html?param=%c1%b6%c8%b8%c1%df%c0%d4%b4%cf%b4%d9.&postfix={postfix2}",
+            timeout=10
+        )
+        time.sleep(1)
+
+        # 4) 헤더 업데이트
         SESSION.headers.update({
             'Referer': 'https://seibro.or.kr/websquare/control.jsp?w2xPath=/IPORTAL/user/bond/BIP_CNTS03005V.xml',
             'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
             'X-Requested-With': 'XMLHttpRequest',
             'Accept': 'application/xml, text/xml, */*',
         })
-        print("✅ 세션 초기화 완료")
+
+        print(f"✅ 세션 초기화 완료. 쿠키: {dict(SESSION.cookies)}")
         return True
     except Exception as e:
         print(f"❌ 세션 초기화 실패: {e}")
@@ -68,9 +89,13 @@ def seibro_call(action, isin, extra_params=""):
 
         root = ET.fromstring(cleaned.encode('utf-8'))
 
-        # ✅ 디버깅: 파싱된 XML 전체 출력
-        print(f"  🔍 [{action}] 파싱된 XML:")
-        print(ET.tostring(root, encoding='unicode')[:500])
+        # WARNING 체크
+        warning = root.find('.//WARNING')
+        if warning is not None:
+            msg = warning.find('msg')
+            if msg is not None:
+                print(f"  ⚠ WARNING [{action}]: {msg.get('value', '')}")
+            return None
 
         return root
 
@@ -110,7 +135,7 @@ def get_mezzanine_data(isin, corp_name):
     xrc_price = '0'
     issu_dt   = '-'
 
-    # ── 1) issuInfoViewEL1 ────────────────────────────
+    # ── 1) issuInfoViewEL1: 종목명 + 발행일 + 종류 ───
     root = seibro_call('issuInfoViewEL1', isin)
     if root is not None:
         result_el = root.find('.//result')
@@ -134,7 +159,6 @@ def get_mezzanine_data(isin, corp_name):
                     bond_type = 'BW'
         else:
             print(f"  ⚠ result 엘리먼트 없음")
-            # ✅ 모든 태그 출력해서 실제 구조 확인
             for el in root.iter():
                 print(f"      태그: {el.tag}, 속성: {el.attrib}")
 
