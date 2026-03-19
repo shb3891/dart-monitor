@@ -21,16 +21,15 @@ worksheet = sh.get_worksheet(0)
 TEST_MODE = True
 TEST_LIMIT = 3
 
-BASE_URL = "http://seibro.or.kr/OpenPlatform/callOpenAPI.jsp"
+# ✅ https로 변경
+BASE_URL = "https://seibro.or.kr/OpenPlatform/callOpenAPI.jsp"
 
 def seibro_api(api_id, params_dict):
     params_str = ','.join([f"{k}:{v}" for k, v in params_dict.items()])
+    full_url = f"{BASE_URL}?key={SEIBRO_KEY}&apiId={api_id}&params={params_str}"
+    print(f"  🌐 호출 URL: {full_url}")
     try:
-        r = requests.get(
-            BASE_URL,
-            params={'key': SEIBRO_KEY, 'apiId': api_id, 'params': params_str},
-            timeout=10
-        )
+        r = requests.get(full_url, timeout=10)
         r.raise_for_status()
 
         try:
@@ -38,9 +37,7 @@ def seibro_api(api_id, params_dict):
         except Exception:
             decoded = r.content.decode('utf-8', errors='replace')
 
-        # ✅ 디버깅: 실제 응답 출력
-        print(f"  📡 [{api_id}] 실제 응답:")
-        print(decoded[:800])
+        print(f"  📡 응답 앞 300자: {decoded[:300]}")
 
         cleaned = re.sub(r'<\?xml[^?]*\?>', '', decoded).strip()
         if not cleaned:
