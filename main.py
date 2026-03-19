@@ -30,20 +30,31 @@ def seibro_api(api_id, params_dict):
         r = requests.get(full_url, timeout=10)
         r.raise_for_status()
 
-        decoded = r.content.decode('utf-8', errors='replace')
+        # ✅ euc-kr과 utf-8 둘 다 시도
+        for encoding in ['utf-8', 'euc-kr']:
+            try:
+                decoded = r.content.decode(encoding, errors='strict')
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            decoded = r.content.decode('utf-8', errors='replace')
+
         cleaned = re.sub(r'<\?xml[^?]*\?>', '', decoded).strip()
         if not cleaned:
+            print(f"  ⚠ [{api_id}] 빈 응답")
             return None
 
         root = ET.fromstring(cleaned.encode('utf-8'))
 
         vector = root.find('.//vector')
         if vector is None:
+            print(f"  ⚠ [{api_id}] vector 없음")
             return None
 
         result_count = vector.get('result', '0')
         if result_count == '0':
-            print(f"  ⚠ [{api_id}] 결과 없음")
+            print(f"  ⚠ [{api_id}] 결과 없음 (isin: {params_dict})")
             return None
 
         return root
@@ -65,12 +76,12 @@ def format_date(raw):
     return raw or '-'
 
 def extract_hosu(nm):
-    """종목명에서 회차 추출. 예: 만호제강1EB → 1, 한진109CB → 109"""
+    """종목명에서 회차 추출."""
     m = re.search(r'제\s*(\d+)\s*회', nm or '')
     if m:
         return m.group(1)
-    # 회사명 바로 뒤 숫자 추출. 예: 만호제강1EB → 1
-    m = re.search(r'[가-힣a-zA-Z]+(\d+)[A-Z]{2}', nm or '')
+    # 회사명 뒤 숫자 추출. 예: 만호제강1EB → 1, 한진 109CB → 109
+    m = re.search(r'[가-힣a-zA-Z\s]+\s*(\d+)\s*(?:CB|EB|BW)', nm or '')
     if m:
         return m.group(1)
     m = re.search(r'(\d+)회', nm or '')
@@ -79,8 +90,9 @@ def extract_hosu(nm):
     return '-'
 
 def extract_corp_name(nm):
-    """종목명에서 회사명만 추출. 예: 만호제강1EB(사모/교환/풋) → 만호제강"""
-    m = re.match(r'([가-힣a-zA-Z\s]+?)(\d+)', nm or '')
+    """종목명에서 회사명만 추출."""
+    # CB/EB/BW 앞 숫자 이전까지
+    m = re.match(r'([가-힣a-zA-Z\s]+?)\s*\d+\s*(?:CB|EB|BW)', nm or '')
     if m:
         return m.group(1).strip()
     return nm.split('(')[0].strip() if nm else '-'
@@ -99,14 +111,12 @@ def get_mezzanine_data(isin):
     print(f"\n{'='*50}")
     print(f"  🔍 조회 중: {isin}")
 
-    corp_name      = '-'
     hosu           = '-'
     bond_type      = '-'
     xrc_price      = '0'
     issu_dt        = '-'
     right_start_dt = '-'
 
-    # ── getBondStatInfo: 종목명, 발행일, 종류, 회차 ──
     root = seibro_api('getBondStatInfo', {'ISIN': isin})
     if root is not None:
         result_el = root.find('.//result')
@@ -115,23 +125,13 @@ def get_mezzanine_data(isin):
             issu_dt   = format_date(get_attr(result_el, 'ISSU_DT'))
             bond_type = determine_bond_type(secn_nm)
             hosu      = extract_hosu(secn_nm)
-            corp_name = extract_corp_name(secn_nm)
 
             print(f"  📌 종목명(API): {secn_nm}")
-            print(f"  🏢 회사명: {corp_name}")
             print(f"  📅 발행일: {issu_dt}")
             print(f"  🏷 종류: {bond_type}")
             print(f"  🔢 회차: {hosu}")
 
-    # 반환: [종목명, 회차, 종류, 행사가액, 발행일, 권리청구시작일]
-    result = {
-        'corp_name': corp_name,
-        'hosu': hosu,
-        'bond_type': bond_type,
-        'xrc_price': xrc_price,
-        'issu_dt': issu_dt,
-        'right_start_dt': right_start_dt,
-    }
+    result = [hosu, bond_type, xrc_price, issu_dt, right_start_dt]
     print(f"  ✅ 최종 결과: {result}")
     return result
 
@@ -139,7 +139,6 @@ async def main():
     print("📋 스프레드시트 읽는 중...")
     all_values = worksheet.get_all_values()
 
-    # B열에 ISIN이 있는 행만 처리 (헤더 제외)
     data_rows = [
         (i + 2, row)
         for i, row in enumerate(all_values[1:])
@@ -150,40 +149,24 @@ async def main():
         data_rows = data_rows[:TEST_LIMIT]
         print(f"🧪 테스트 모드: 상위 {TEST_LIMIT}개 종목만 실행\n")
 
-    # A열(종목명), C~G열 업데이트
-    a_updates = []   # 종목명
-    cg_updates = []  # 회차~권리청구시작일
+    batch_updates = []
     start_row = data_rows[0][0] if data_rows else 2
 
     for sheet_row, row in data_rows:
         isin = row[1].strip()
         result = get_mezzanine_data(isin)
-
-        a_updates.append([result['corp_name']])
-        cg_updates.append([
-            result['hosu'],
-            result['bond_type'],
-            result['xrc_price'],
-            result['issu_dt'],
-            result['right_start_dt'],
-        ])
+        batch_updates.append(result)
         await asyncio.sleep(1.0)
 
-    if cg_updates:
-        end_row = start_row + len(cg_updates) - 1
-
-        # A열 종목명 업데이트
+    if batch_updates:
+        end_row = start_row + len(batch_updates) - 1
+        range_str = f"C{start_row}:G{end_row}"
+        # ✅ A열은 건드리지 않고 C~G열만 업데이트
         worksheet.update(
-            range_name=f"A{start_row}:A{end_row}",
-            values=a_updates
+            range_name=range_str,
+            values=batch_updates
         )
-
-        # C~G열 업데이트
-        worksheet.update(
-            range_name=f"C{start_row}:G{end_row}",
-            values=cg_updates
-        )
-        print(f"\n🏁 완료! {len(cg_updates)}개 종목 업데이트됨")
+        print(f"\n🏁 완료! {len(batch_updates)}개 종목 → {range_str} 업데이트됨")
 
 if __name__ == "__main__":
     asyncio.run(main())
