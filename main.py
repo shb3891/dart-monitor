@@ -5,6 +5,9 @@ import gspread
 import requests
 import xml.etree.ElementTree as ET
 import re
+import zipfile
+import io
+from datetime import datetime, timedelta
 from google.oauth2.service_account import Credentials
 
 # ============================================================
@@ -13,26 +16,33 @@ from google.oauth2.service_account import Credentials
 SEIBRO_KEY = os.environ.get('SEIBRO_KEY', 'e1e03a31bc0583fc0c853d4c41a0dc018dc4d2aa21c363c3d6b1b0b96e85221b')
 SHEET_ID   = os.environ.get('SHEET_ID',   '1s73BDNtCPe5mOs9EjBE5npEfcaNtYRyWJxRBUmJI-WA')
 
+DART_KEY = (
+    os.environ.get('DART_API_KEY') or
+    os.environ.get('DART_KEY') or
+    os.environ.get('DART_API') or
+    'bfc4e4e445de4727ae0bcc27e80ba5cf0e3818e6'
+)
+
 # ============================================================
 # [API 승인 플래그]
 # ============================================================
-API_BOND_APPROVED    = True   # ✅ 채권정보
-API_STOCK_APPROVED   = True   # ✅ 주식정보
-API_DERIV_APPROVED   = True   # ✅ 파생결합증권정보
-API_CORP_APPROVED    = True   # ✅ 기업정보
-API_FOREIGN_APPROVED = True   # ✅ 외화증권정보
+API_BOND_APPROVED    = True
+API_STOCK_APPROVED   = True
+API_DERIV_APPROVED   = True
+API_CORP_APPROVED    = True
+API_FOREIGN_APPROVED = True
+API_DART_YTM         = True
 
 # ============================================================
 # [테스트 / 디버그 모드]
 # ============================================================
-TEST_MODE  = False  # True면 상위 3개만 실행
-DEBUG_MODE = True   # True면 특정 종목 raw XML 출력 후 종료
+TEST_MODE  = False
+DEBUG_MODE = False
 
-# 디버깅할 ISIN 목록 (PUT/CALL 있는 종목 위주로 선택)
 DEBUG_ISINS = [
-    "KR6214271E32",  # FSN 13회 CB (PUT 확인됨)
-    "KR6222421DC0",  # 쎄노텍 3회 CB (PUT 확인됨)
-    "KR6049122EC3",  # 파인디앤씨 11회 CB (Coupon=1 확인됨)
+    "KR6177831E26",  # 파버나인 5회 CB
+    "KR6214271E32",  # FSN 13회 CB
+    "KR6222421DC0",  # 쎄노텍 3회 CB
 ]
 
 # ============================================================
@@ -48,20 +58,19 @@ gc        = gspread.authorize(creds)
 sh        = gc.open_by_key(SHEET_ID)
 worksheet = sh.get_worksheet(0)
 
-BASE_URL = "https://seibro.or.kr/OpenPlatform/callOpenAPI.jsp"
+SEIBRO_BASE = "https://seibro.or.kr/OpenPlatform/callOpenAPI.jsp"
+DART_BASE   = "https://opendart.fss.or.kr/api"
 
 
 # ============================================================
-# [공통 유틸]
+# [SEIBRO 공통 유틸]
 # ============================================================
 def seibro_api(api_id, params_dict):
-    """SEIBRO OpenAPI 호출 공통 함수"""
     params_str = ','.join([f"{k}:{v}" for k, v in params_dict.items()])
-    full_url   = f"{BASE_URL}?key={SEIBRO_KEY}&apiId={api_id}&params={params_str}"
+    full_url   = f"{SEIBRO_BASE}?key={SEIBRO_KEY}&apiId={api_id}&params={params_str}"
     try:
         r = requests.get(full_url, timeout=10)
         r.raise_for_status()
-
         for encoding in ['utf-8', 'euc-kr']:
             try:
                 decoded = r.content.decode(encoding, errors='strict')
@@ -92,12 +101,11 @@ def seibro_api(api_id, params_dict):
         return root
 
     except Exception as e:
-        print(f"  ⚠ API 호출 실패 [{api_id}]: {e}")
+        print(f"  ⚠ SEIBRO 호출 실패 [{api_id}]: {e}")
         return None
 
 
 def get_attr(element, tag):
-    """XML 엘리먼트에서 value 속성 추출"""
     el = element.find(f'.//{tag}')
     if el is not None:
         return el.get('value', '')
@@ -105,7 +113,6 @@ def get_attr(element, tag):
 
 
 def format_date(raw):
-    """YYYYMMDD → YYYY-MM-DD 변환"""
     raw = str(raw).strip() if raw else ''
     if len(raw) == 8 and raw.isdigit():
         return f"{raw[:4]}-{raw[4:6]}-{raw[6:]}"
@@ -113,7 +120,6 @@ def format_date(raw):
 
 
 def fmt_number(val):
-    """숫자 문자열에 콤마 포맷 (0이면 빈칸)"""
     if not val or val == '0':
         return ''
     try:
@@ -123,7 +129,6 @@ def fmt_number(val):
 
 
 def extract_hosu(nm):
-    """종목명에서 회차 추출"""
     m = re.search(r'제\s*(\d+)\s*회', nm or '')
     if m:
         return m.group(1)
@@ -137,7 +142,6 @@ def extract_hosu(nm):
 
 
 def extract_corp_name(nm):
-    """종목명에서 회사명 추출"""
     m = re.match(r'([가-힣a-zA-Z\s]+?)\s*\d+\s*(?:CB|EB|BW)', nm or '')
     if m:
         return m.group(1).strip()
@@ -145,7 +149,6 @@ def extract_corp_name(nm):
 
 
 def determine_bond_type(secn_nm):
-    """종목명에서 CB/EB/BW 구분"""
     nm = secn_nm or ''
     if 'EB' in nm or '교환' in nm:
         return 'EB'
@@ -157,27 +160,150 @@ def determine_bond_type(secn_nm):
 
 
 # ============================================================
+# [DART API 유틸]
+# ============================================================
+def dart_get_corp_code(stock_code_6):
+    """6자리 주식 단축코드 → DART corp_code"""
+    try:
+        url = f"{DART_BASE}/company.json"
+        r = requests.get(url, params={'crtfc_key': DART_KEY, 'stock_code': stock_code_6}, timeout=10)
+        data = r.json()
+        if data.get('status') == '000':
+            corp_code = data.get('corp_code', '')
+            print(f"    📌 DART corp_code: {corp_code} ({data.get('corp_name', '')})")
+            return corp_code
+    except Exception as e:
+        print(f"    ⚠ DART corp_code 조회 실패: {e}")
+    return None
+
+
+def dart_search_cb_disclosure(corp_code, issu_dt_str):
+    """CB/BW/EB 발행결정 공시 검색 → rcept_no 반환"""
+    try:
+        issu_date = datetime.strptime(issu_dt_str, '%Y-%m-%d')
+        bgn_de = (issu_date - timedelta(days=30)).strftime('%Y%m%d')
+        end_de = (issu_date + timedelta(days=5)).strftime('%Y%m%d')
+
+        url = f"{DART_BASE}/list.json"
+        params = {
+            'crtfc_key':  DART_KEY,
+            'corp_code':  corp_code,
+            'pblntf_ty':  'B',
+            'bgn_de':     bgn_de,
+            'end_de':     end_de,
+            'page_count': 20,
+        }
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+
+        if data.get('status') not in ('000', '013'):
+            print(f"    ⚠ DART 공시목록 조회 실패: {data.get('message', '')}")
+            return None
+
+        keywords = ['전환사채', '신주인수권', '교환사채']
+        for item in data.get('list', []):
+            rpt = item.get('report_nm', '')
+            if any(kw in rpt for kw in keywords):
+                rcept_no = item.get('rcept_no')
+                print(f"    📄 DART 공시 발견: {rpt} ({rcept_no})")
+                return rcept_no
+
+        print(f"    ℹ DART 해당 공시 없음 (기간: {bgn_de}~{end_de})")
+    except Exception as e:
+        print(f"    ⚠ DART 공시검색 실패: {e}")
+    return None
+
+
+def dart_parse_ytm(rcept_no):
+    """공시 문서 ZIP 다운로드 → 만기이자율 파싱"""
+    try:
+        url = f"{DART_BASE}/document.xml"
+        r = requests.get(url, params={'crtfc_key': DART_KEY, 'rcept_no': rcept_no}, timeout=30)
+
+        z = zipfile.ZipFile(io.BytesIO(r.content))
+
+        for fname in z.namelist():
+            if not (fname.endswith('.xml') or fname.endswith('.html') or fname.endswith('.htm')):
+                continue
+
+            raw = z.read(fname)
+            text = None
+            for enc in ['utf-8', 'euc-kr', 'cp949']:
+                try:
+                    text = raw.decode(enc)
+                    break
+                except Exception:
+                    continue
+            if not text:
+                continue
+
+            clean = re.sub(r'<[^>]+>', ' ', text)
+            clean = re.sub(r'\s+', ' ', clean)
+
+            patterns = [
+                r'만기이자율\s*[\(%\s]*([0-9]+(?:\.[0-9]+)?)',
+                r'만기\s*이자율[^0-9]*([0-9]+(?:\.[0-9]+)?)',
+                r'보장\s*수익률[^0-9]*([0-9]+(?:\.[0-9]+)?)',
+            ]
+            for pat in patterns:
+                m = re.search(pat, clean)
+                if m:
+                    val = m.group(1)
+                    print(f"    ✅ 만기이자율 파싱: {val}%")
+                    return val
+
+        print(f"    ℹ 만기이자율 텍스트 미발견")
+    except Exception as e:
+        print(f"    ⚠ DART 문서 파싱 실패: {e}")
+    return ''
+
+
+def parse_dart_ytm_for_bond(isin, issu_dt_str, xrc_stk_isin):
+    """CB/BW/EB 1개 종목의 YTM을 DART에서 가져오는 메인 함수"""
+    if not API_DART_YTM:
+        return ''
+
+    stock_code_6 = ''
+    if xrc_stk_isin and len(xrc_stk_isin) >= 9:
+        stock_code_6 = xrc_stk_isin[3:9]
+
+    if not stock_code_6:
+        print(f"    ⚠ 주식 단축코드 추출 실패: {xrc_stk_isin}")
+        return ''
+
+    corp_code = dart_get_corp_code(stock_code_6)
+    if not corp_code:
+        return ''
+
+    rcept_no = dart_search_cb_disclosure(corp_code, issu_dt_str)
+    if not rcept_no:
+        return ''
+
+    ytm = dart_parse_ytm(rcept_no)
+    return ytm
+
+
+# ============================================================
 # [디버깅용] raw XML 출력 함수
 # ============================================================
 def debug_raw_xml(isin):
-    """특정 ISIN의 API 응답 raw XML 출력 — 필드명 확인용"""
     print(f"\n{'='*60}")
     print(f"🔬 디버깅 ISIN: {isin}")
 
     apis = [
-        ('getXrcStkStatInfo',      {'BOND_ISIN': isin}),   # 행사가액 / 리픽싱플로어
-        ('getBondOptionXrcInfo',   {'ISIN': isin}),         # PUT / CALL
-        ('getXrcStkOptionXrcInfo', {'BOND_ISIN': isin}),    # 권리청구기간
+        ('getXrcStkStatInfo',      {'BOND_ISIN': isin}),
+        ('getBondOptionXrcInfo',   {'ISIN': isin}),
+        ('getXrcStkOptionXrcInfo', {'BOND_ISIN': isin}),
     ]
 
     for api_id, params in apis:
         print(f"\n--- {api_id} ---")
         params_str = ','.join([f"{k}:{v}" for k, v in params.items()])
-        full_url   = f"{BASE_URL}?key={SEIBRO_KEY}&apiId={api_id}&params={params_str}"
+        full_url   = f"{SEIBRO_BASE}?key={SEIBRO_KEY}&apiId={api_id}&params={params_str}"
         try:
             r = requests.get(full_url, timeout=10)
             decoded = r.content.decode('utf-8', errors='replace')
-            print(decoded[:3000])  # 최대 3000자 출력
+            print(decoded[:3000])
         except Exception as e:
             print(f"  ⚠ 호출 실패: {e}")
 
@@ -185,11 +311,9 @@ def debug_raw_xml(isin):
 
 
 # ============================================================
-# [파싱 함수들]
+# [SEIBRO 파싱 함수들]
 # ============================================================
-
 def parse_bond_basic(isin):
-    """getBondStatInfo → A(종목명), C(회차), D(종류), E(발행일), F(만기일), G(Coupon)"""
     root = seibro_api('getBondStatInfo', {'ISIN': isin})
     if root is None:
         return None
@@ -218,7 +342,6 @@ def parse_bond_basic(isin):
 
 
 def parse_put_call(isin):
-    """getBondOptionXrcInfo → M(PUT시작일), N(PUT종료일), O(PUT상환지급일), Q(CALL비율), R(CALL시작일), S(CALL종료일)"""
     root = seibro_api('getBondOptionXrcInfo', {'ISIN': isin})
 
     result = {
@@ -240,12 +363,12 @@ def parse_put_call(isin):
         erly_red_dt = format_date(get_attr(result_el, 'ERLY_RED_DT'))
         xrc_ratio   = get_attr(result_el, 'XRC_RATIO')
 
-        if option_tpcd in ('9402', '9403'):  # PUT 또는 CALL+PUT
+        if option_tpcd in ('9402', '9403'):
             result['put_begin'] = result['put_begin'] or xrc_begin
             result['put_end']   = result['put_end']   or xrc_end
             result['put_date']  = result['put_date']  or erly_red_dt
 
-        if option_tpcd in ('9401', '9403'):  # CALL 또는 CALL+PUT
+        if option_tpcd in ('9401', '9403'):
             result['call_begin'] = result['call_begin'] or xrc_begin
             result['call_end']   = result['call_end']   or xrc_end
             result['call_ratio'] = result['call_ratio'] or xrc_ratio
@@ -254,26 +377,20 @@ def parse_put_call(isin):
 
 
 def parse_exercise_info(isin):
-    """
-    getXrcStkStatInfo      → I(행사가액), J(리픽싱플로어)
-    getXrcStkOptionXrcInfo → K(권리청구시작일), L(권리청구종료일)
-    """
     result = {
-        'xrc_price':  '',
-        'rfxg_floor': '',
-        'xrc_begin':  '',
-        'xrc_end':    '',
+        'xrc_price':    '',
+        'xrc_begin':    '',
+        'xrc_end':      '',
+        'xrc_stk_isin': '',
     }
 
-    # --- 행사가액 + 리픽싱플로어 ---
     root = seibro_api('getXrcStkStatInfo', {'BOND_ISIN': isin})
     if root is not None:
         result_el = root.find('.//result')
         if result_el is not None:
-            result['xrc_price']  = fmt_number(get_attr(result_el, 'XRC_PRICE'))
-            result['rfxg_floor'] = fmt_number(get_attr(result_el, 'RFXG_FLOOR_PRICE'))
+            result['xrc_price']    = fmt_number(get_attr(result_el, 'XRC_PRICE'))
+            result['xrc_stk_isin'] = get_attr(result_el, 'XRC_STK_ISIN')
 
-    # --- 권리청구기간 ---
     root2 = seibro_api('getXrcStkOptionXrcInfo', {'BOND_ISIN': isin})
     if root2 is not None:
         begin_dates = []
@@ -299,13 +416,13 @@ def parse_exercise_info(isin):
 def get_mezzanine_data(isin, existing_row):
     print(f"  🔍 {isin}", end=' ')
 
-    # 기본정보
     basic = parse_bond_basic(isin)
     if basic:
         print(f"→ {basic['corp_name']} {basic['hosu']}회 {basic['bond_type']}", end=' ')
         corp_name = basic['corp_name']
         basic_row = [basic['hosu'], basic['bond_type'], basic['issu_dt'], basic['xpir_dt']]
         coupon    = basic['coupon']
+        issu_dt   = basic['issu_dt']
     else:
         print(f"→ ⚠ getBondStatInfo 실패 (기존값 유지)", end=' ')
         corp_name = existing_row[0].strip() if len(existing_row) > 0 else '-'
@@ -315,24 +432,29 @@ def get_mezzanine_data(isin, existing_row):
             existing_row[4].strip() if len(existing_row) > 4 else '-',
             existing_row[5].strip() if len(existing_row) > 5 else '-',
         ]
-        coupon = existing_row[6].strip() if len(existing_row) > 6 else ''
+        coupon  = existing_row[6].strip() if len(existing_row) > 6 else ''
+        issu_dt = existing_row[4].strip() if len(existing_row) > 4 else ''
 
-    # PUT/CALL
     put_call = parse_put_call(isin) if API_BOND_APPROVED else {
         'put_begin': '', 'put_end': '', 'put_date': '',
         'call_ratio': '', 'call_begin': '', 'call_end': '',
     }
 
-    # 행사가액·리픽싱플로어·권리청구기간
     exercise = parse_exercise_info(isin) if API_STOCK_APPROVED else {
-        'xrc_price': '', 'rfxg_floor': '', 'xrc_begin': '', 'xrc_end': '',
+        'xrc_price': '', 'xrc_begin': '', 'xrc_end': '', 'xrc_stk_isin': '',
     }
+
+    ytm = ''
+    if API_DART_YTM and exercise.get('xrc_stk_isin') and issu_dt and issu_dt != '-':
+        print(f"\n    🌐 DART YTM 조회 중...")
+        ytm = parse_dart_ytm_for_bond(isin, issu_dt, exercise['xrc_stk_isin'])
 
     print()
     return {
         'corp_name': corp_name,
         'basic_row': basic_row,
         'coupon':    coupon,
+        'ytm':       ytm,
         'put_call':  put_call,
         'exercise':  exercise,
     }
@@ -343,15 +465,13 @@ def get_mezzanine_data(isin, existing_row):
 # ============================================================
 async def main():
 
-    # ── 디버그 모드: raw XML 확인 후 종료 ──────────────────
     if DEBUG_MODE:
-        print("🔬 디버그 모드 실행 중 (시트 업데이트 안 함)\n")
+        print("🔬 디버그 모드 (시트 업데이트 안 함)\n")
         for isin in DEBUG_ISINS:
             debug_raw_xml(isin)
             await asyncio.sleep(1.0)
         print("✅ 디버그 완료. DEBUG_MODE = False 로 바꾸고 다시 실행하세요.")
         return
-    # ───────────────────────────────────────────────────────
 
     print("📋 스프레드시트 읽는 중...")
     all_values = worksheet.get_all_values()
@@ -372,17 +492,13 @@ async def main():
         print("⚠ 데이터 없음. 종료.")
         return
 
-    # 결과 수집
     results = []
     for sheet_row, row in data_rows:
         isin   = row[1].strip()
         result = get_mezzanine_data(isin, row)
         results.append((sheet_row, result))
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(1.5)
 
-    # --------------------------------------------------------
-    # 시트 업데이트 (DeprecationWarning 수정: values 먼저, range_name 나중)
-    # --------------------------------------------------------
     print("\n📝 시트 업데이트 중...")
     first_row = results[0][0]
     last_row  = results[-1][0]
@@ -408,19 +524,19 @@ async def main():
     )
     await asyncio.sleep(1.0)
 
+    # H열: YTM (DART)
+    if API_DART_YTM:
+        worksheet.update(
+            [[r['ytm']] for _, r in results],
+            range_name=f"H{first_row}:H{last_row}"
+        )
+        await asyncio.sleep(1.0)
+
     # I열: 행사가액
     if API_STOCK_APPROVED:
         worksheet.update(
             [[r['exercise']['xrc_price']] for _, r in results],
             range_name=f"I{first_row}:I{last_row}"
-        )
-        await asyncio.sleep(1.0)
-
-    # J열: 리픽싱플로어
-    if API_STOCK_APPROVED:
-        worksheet.update(
-            [[r['exercise']['rfxg_floor']] for _, r in results],
-            range_name=f"J{first_row}:J{last_row}"
         )
         await asyncio.sleep(1.0)
 
@@ -448,23 +564,21 @@ async def main():
         )
         await asyncio.sleep(1.0)
 
-    # --------------------------------------------------------
-    # 완료 리포트
-    # --------------------------------------------------------
+    ytm_count = sum(1 for _, r in results if r.get('ytm'))
     print(f"\n🏁 완료! {len(results)}개 종목 업데이트됨")
     print(f"👉 https://docs.google.com/spreadsheets/d/{SHEET_ID}")
     print(f"\n📌 업데이트 현황:")
     print(f"  ✅ A열    종목명")
     print(f"  ✅ C~F열  회차·종류·발행일·만기일")
     print(f"  ✅ G열    Coupon")
+    print(f"  ✅ H열    YTM  ← DART 연동 ({ytm_count}/{len(results)}개 성공)")
     print(f"  ✅ I열    행사가액")
-    print(f"  ✅ J열    리픽싱플로어")
     print(f"  ✅ K~L열  권리청구기간")
     print(f"  ✅ M~O열  PUT 정보")
     print(f"  ✅ Q~S열  CALL 정보")
-    print(f"  ⏳ H열    YTM  (수동 입력 또는 추후)")
-    print(f"  ⏳ P열    YTP  (수동 입력 또는 추후)")
-    print(f"  ⏳ T열    YTC  (수동 입력 또는 추후)")
+    print(f"  ⏳ J열    리픽싱플로어  (추후 DART 연동)")
+    print(f"  ⏳ P열    YTP  (추후)")
+    print(f"  ⏳ T열    YTC  (추후)")
 
 
 if __name__ == "__main__":
