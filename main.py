@@ -36,13 +36,13 @@ API_DART_YTM         = True
 # ============================================================
 # [테스트 / 디버그 모드]
 # ============================================================
-TEST_MODE  = False  # ← 전체 110개 실행
+TEST_MODE  = False
 DEBUG_MODE = False
 
 DEBUG_ISINS = [
-    "KR6177831E26",  # 파버나인 5회 CB
-    "KR6214271E32",  # FSN 13회 CB
-    "KR6222421DC0",  # 쎄노텍 3회 CB
+    "KR6177831E26",
+    "KR6214271E32",
+    "KR6222421DC0",
 ]
 
 # ============================================================
@@ -60,6 +60,40 @@ worksheet = sh.get_worksheet(0)
 
 SEIBRO_BASE = "https://seibro.or.kr/OpenPlatform/callOpenAPI.jsp"
 DART_BASE   = "https://opendart.fss.or.kr/api"
+
+# ============================================================
+# [DART 기업코드 딕셔너리] 전역 캐시
+# stock_code(6자리) → corp_code(8자리)
+# ============================================================
+DART_CORP_DICT = {}
+
+def load_dart_corp_codes():
+    """
+    DART corpCode.xml ZIP 다운로드 → stock_code → corp_code 딕셔너리 생성
+    프로그램 시작 시 1회만 호출
+    """
+    global DART_CORP_DICT
+    try:
+        print(f"  📥 DART 기업코드 전체 다운로드 중...")
+        url = f"{DART_BASE}/corpCode.xml"
+        r = requests.get(url, params={'crtfc_key': DART_KEY}, timeout=30)
+        print(f"  📥 응답코드: {r.status_code} / 크기: {len(r.content):,} bytes")
+
+        z = zipfile.ZipFile(io.BytesIO(r.content))
+        xml_data = z.read('CORPCODE.xml')
+        root = ET.fromstring(xml_data)
+
+        count = 0
+        for item in root.findall('.//list'):
+            corp_code  = item.findtext('corp_code', '').strip()
+            stock_code = item.findtext('stock_code', '').strip()
+            if stock_code and len(stock_code) == 6:
+                DART_CORP_DICT[stock_code] = corp_code
+                count += 1
+
+        print(f"  ✅ DART 기업코드 로드 완료: {count:,}개 (상장사)")
+    except Exception as e:
+        print(f"  ⚠ DART 기업코드 로드 실패: {e}")
 
 
 # ============================================================
@@ -163,27 +197,19 @@ def determine_bond_type(secn_nm):
 # [DART API 유틸]
 # ============================================================
 def dart_get_corp_code(stock_code_6):
-    """6자리 주식 단축코드 → DART corp_code"""
-    try:
-        url = f"{DART_BASE}/company.json"
-        r = requests.get(url, params={'crtfc_key': DART_KEY, 'stock_code': stock_code_6}, timeout=10)
-        print(f"    🌐 DART company API 응답코드: {r.status_code}")
-        data = r.json()
-        print(f"    🌐 DART company API status: {data.get('status')} / message: {data.get('message','')}")
-        if data.get('status') == '000':
-            corp_code = data.get('corp_code', '')
-            print(f"    📌 DART corp_code: {corp_code} ({data.get('corp_name', '')})")
-            return corp_code
-    except Exception as e:
-        print(f"    ⚠ DART corp_code 조회 실패: {e}")
-    return None
+    """딕셔너리에서 corp_code 조회"""
+    corp_code = DART_CORP_DICT.get(stock_code_6, '')
+    if corp_code:
+        print(f"    📌 corp_code: {corp_code} (stock: {stock_code_6})")
+    else:
+        print(f"    ⚠ corp_code 없음 (stock: {stock_code_6})")
+    return corp_code
 
 
 def dart_search_cb_disclosure(corp_code, issu_dt_str):
     """CB/BW/EB 발행결정 공시 검색 → rcept_no 반환"""
     try:
         issu_date = datetime.strptime(issu_dt_str, '%Y-%m-%d')
-        # 검색 범위: 발행일 60일 전 ~ 10일 후 (만호제강 같은 최근 종목 커버)
         bgn_de = (issu_date - timedelta(days=60)).strftime('%Y%m%d')
         end_de = (issu_date + timedelta(days=10)).strftime('%Y%m%d')
 
@@ -274,14 +300,11 @@ def parse_dart_ytm_for_bond(isin, issu_dt_str, xrc_stk_isin):
     if not API_DART_YTM:
         return ''
 
-    print(f"    🔑 DART_KEY 앞6자리: {DART_KEY[:6] if DART_KEY else '없음'}")
-    print(f"    📎 xrc_stk_isin={xrc_stk_isin}", end=' ')
-
     stock_code_6 = ''
     if xrc_stk_isin and len(xrc_stk_isin) >= 9:
         stock_code_6 = xrc_stk_isin[3:9]
 
-    print(f"→ stock_code_6={stock_code_6}")
+    print(f"    📎 xrc_stk_isin={xrc_stk_isin} → stock_code_6={stock_code_6}")
 
     if not stock_code_6:
         print(f"    ⚠ 주식 단축코드 추출 실패 → 중단")
@@ -289,7 +312,6 @@ def parse_dart_ytm_for_bond(isin, issu_dt_str, xrc_stk_isin):
 
     corp_code = dart_get_corp_code(stock_code_6)
     if not corp_code:
-        print(f"    ⚠ corp_code 없음 → 중단")
         return ''
 
     rcept_no = dart_search_cb_disclosure(corp_code, issu_dt_str)
@@ -488,10 +510,15 @@ async def main():
         for isin in DEBUG_ISINS:
             debug_raw_xml(isin)
             await asyncio.sleep(1.0)
-        print("✅ 디버그 완료. DEBUG_MODE = False 로 바꾸고 다시 실행하세요.")
+        print("✅ 디버그 완료.")
         return
 
     print(f"🔑 DART_KEY 로드 확인: {DART_KEY[:6] if DART_KEY else '없음'}...")
+
+    # DART 기업코드 딕셔너리 로드 (1회)
+    if API_DART_YTM:
+        load_dart_corp_codes()
+
     print("📋 스프레드시트 읽는 중...")
     all_values = worksheet.get_all_values()
 
