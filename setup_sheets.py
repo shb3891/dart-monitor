@@ -23,7 +23,6 @@ def col_num_to_letter(n):
 def fix_master_sheet():
     ws = sh.get_worksheet(0)
 
-    # 헤더 업데이트
     headers = [
         '종목명', '예탁원 종목코드', '회차', '종류',
         '발행일', '만기일', 'Coupon', 'YTM',
@@ -34,44 +33,41 @@ def fix_master_sheet():
     ]
     ws.update('A1', [headers])
 
-    # 기존 데이터 읽기
     all_data = ws.get_all_values()
     data_rows = [r for r in all_data[1:] if len(r) > 1 and r[1].strip().startswith('KR')]
 
-    # 기존 데이터를 새 구조에 맞게 재배치
-    # 기존: A종목명 B ISIN C회차 D종류 E행사가액 F발행일 G만기일
-    # 새로: A종목명 B ISIN C회차 D종류 E발행일 F만기일 G~ (행사가액은 I열로)
     new_data = []
     for r in data_rows:
         row = [
-            r[0] if len(r) > 0 else '',   # A: 종목명
-            r[1] if len(r) > 1 else '',   # B: ISIN
-            r[2] if len(r) > 2 else '',   # C: 회차
-            r[3] if len(r) > 3 else '',   # D: 종류
-            r[5] if len(r) > 5 else '',   # E: 발행일 (기존 F)
-            r[6] if len(r) > 6 else '',   # F: 만기일 (기존 G)
-            '',                            # G: Coupon
-            '',                            # H: YTM
-            r[4] if len(r) > 4 else '',   # I: 행사가액 (기존 E)
-            '',                            # J: 리픽싱 플로어
-            '',                            # K: 권리청구 시작일
-            '',                            # L: 권리청구 종료일
-            '',                            # M: PUT 시작일
-            '',                            # N: PUT 종료일
-            '',                            # O: PUT 상환지급일
-            '',                            # P: YTP
-            '',                            # Q: CALL 비율
-            '',                            # R: CALL 시작일
-            '',                            # S: CALL 종료일
-            '',                            # T: YTC
+            r[0] if len(r) > 0 else '',
+            r[1] if len(r) > 1 else '',
+            r[2] if len(r) > 2 else '',
+            r[3] if len(r) > 3 else '',
+            r[4] if len(r) > 4 else '',
+            r[5] if len(r) > 5 else '',
+            '',  # G: Coupon
+            '',  # H: YTM
+            '',  # I: 행사가액
+            '',  # J: 리픽싱 플로어
+            '',  # K: 권리청구 시작일
+            '',  # L: 권리청구 종료일
+            '',  # M: PUT 시작일
+            '',  # N: PUT 종료일
+            '',  # O: PUT 상환지급일
+            '',  # P: YTP
+            '',  # Q: CALL 비율
+            '',  # R: CALL 시작일
+            '',  # S: CALL 종료일
+            '',  # T: YTC
         ]
         new_data.append(row)
 
     if new_data:
         ws.update('A2', new_data)
 
-    # 헤더 서식
     requests = []
+
+    # 헤더 서식
     requests.append({'repeatCell': {
         'range': {'sheetId': ws.id, 'startRowIndex': 0, 'endRowIndex': 1,
                   'startColumnIndex': 0, 'endColumnIndex': len(headers)},
@@ -92,7 +88,7 @@ def fix_master_sheet():
     }})
 
     # 열 너비
-    col_widths = [100, 130, 50, 60, 90, 90, 70, 70, 80, 80, 100, 100, 100, 100, 110, 70, 70, 100, 100, 70]
+    col_widths = [100,130,50,60,90,90,70,70,80,80,100,100,100,100,110,70,70,100,100,70]
     for i, w in enumerate(col_widths):
         requests.append({'updateDimensionProperties': {
             'range': {'sheetId': ws.id, 'dimension': 'COLUMNS', 'startIndex': i, 'endIndex': i+1},
@@ -111,7 +107,7 @@ def create_horizontal_sheet(master_ws):
         pass
 
     ws = sh.add_worksheet(title='📊 가로형', rows=200, cols=30)
-    master_name = master_ws.title
+    master_name = master_ws.title  # '시트1'
 
     headers_row1 = [
         '기본정보', '', '', '',
@@ -131,41 +127,28 @@ def create_horizontal_sheet(master_ws):
         '신용등급', '보유고객 (펀드명)', '비고',
     ]
 
-    # 시트1 데이터 개수 파악
     all_data = master_ws.get_all_values()
     data_count = len([r for r in all_data[1:] if len(r) > 1 and r[1].strip().startswith('KR')])
-    start_row = 3
 
-    # 수식으로 시트1 참조
+    # ✅ 시트 이름에 따옴표 없이 수식 생성
     ref_cols = {
-        0: 'A',   # 종목명
-        1: 'B',   # ISIN
-        2: 'C',   # 회차
-        3: 'D',   # 종류
-        4: 'E',   # 발행일
-        5: 'F',   # 만기일
-        6: 'G',   # Coupon
-        7: 'H',   # YTM
-        8: 'I',   # 행사가액
-        9: 'M',   # PUT 시작일
-        10: 'N',  # PUT 종료일
-        11: 'O',  # PUT 상환지급일
-        12: 'P',  # YTP
-        13: 'Q',  # CALL 비율
-        14: 'R',  # CALL 시작일
-        15: 'S',  # CALL 종료일
-        16: 'T',  # YTC
+        0: 'A', 1: 'B', 2: 'C', 3: 'D',
+        4: 'E', 5: 'F',
+        6: 'G', 7: 'H', 8: 'I',
+        9: 'M', 10: 'N', 11: 'O', 12: 'P',
+        13: 'Q', 14: 'R', 15: 'S', 16: 'T',
     }
 
     formula_rows = []
     for i in range(data_count):
-        master_row = i + 2  # 시트1은 2행부터 데이터
+        master_row = i + 2
         row = []
         for col_idx in range(20):
             if col_idx in ref_cols:
-                row.append(f"='{master_name}'!{ref_cols[col_idx]}{master_row}")
+                # ✅ 작은따옴표 없이 시트명 직접 사용
+                row.append(f"={master_name}!{ref_cols[col_idx]}{master_row}")
             else:
-                row.append('')  # 수기입력 칸
+                row.append('')
         formula_rows.append(row)
 
     ws.update('A1', [headers_row1])
@@ -263,7 +246,7 @@ def create_vertical_sheet(master_ws):
         pass
 
     ws = sh.add_worksheet(title='📋 세로형', rows=40, cols=200)
-    master_name = master_ws.title
+    master_name = master_ws.title  # '시트1'
 
     row_labels = [
         '기본정보',
@@ -305,45 +288,42 @@ def create_vertical_sheet(master_ws):
 
     # 시트1 참조 매핑 (행 인덱스 → 시트1 열)
     ref_map = {
-        1:  'A',   # 종목명
-        2:  'B',   # ISIN
-        3:  'C',   # 회차
-        4:  'D',   # 종류
-        9:  'E',   # 발행일
-        10: 'G',   # Coupon
-        11: 'H',   # YTM
-        14: 'I',   # 행사가액
-        15: 'J',   # 리픽싱 플로어
-        18: 'K',   # 권리청구 시작일
-        19: 'L',   # 권리청구 종료일
-        22: 'M',   # PUT 시작일
-        23: 'N',   # PUT 종료일
-        24: 'O',   # PUT 상환지급일
-        25: 'P',   # YTP
-        28: 'Q',   # CALL 비율
-        29: 'R',   # CALL 시작일
-        30: 'S',   # CALL 종료일
-        31: 'T',   # YTC
+        1:  'A',  # 종목명
+        2:  'B',  # ISIN
+        3:  'C',  # 회차
+        4:  'D',  # 종류
+        10: 'G',  # Coupon
+        11: 'H',  # YTM
+        14: 'I',  # 행사가액
+        15: 'J',  # 리픽싱 플로어
+        18: 'K',  # 권리청구 시작일
+        19: 'L',  # 권리청구 종료일
+        22: 'M',  # PUT 시작일
+        23: 'N',  # PUT 종료일
+        24: 'O',  # PUT 상환지급일
+        25: 'P',  # YTP
+        28: 'Q',  # CALL 비율
+        29: 'R',  # CALL 시작일
+        30: 'S',  # CALL 종료일
+        31: 'T',  # YTC
     }
 
-    # A열 항목명
     ws.update('A1', [[label] for label in row_labels])
 
-    # 시트1 데이터 개수
     all_data = master_ws.get_all_values()
     data_rows = [r for r in all_data[1:] if len(r) > 1 and r[1].strip().startswith('KR')]
 
-    # 전체 데이터를 행×열 형태로 구성
     all_col_data = [[''] * len(data_rows) for _ in range(len(row_labels))]
 
     for col_idx in range(len(data_rows)):
         master_row = col_idx + 2
         for row_idx in range(len(row_labels)):
-            if row_idx in ref_map:
-                all_col_data[row_idx][col_idx] = f"='{master_name}'!{ref_map[row_idx]}{master_row}"
-            # 발행일/만기일 합쳐서 표시
             if row_idx == 9:
-                all_col_data[row_idx][col_idx] = f"='{master_name}'!E{master_row}&\" / \"&'{master_name}'!F{master_row}"
+                # ✅ 발행일 / 만기일 합쳐서 표시
+                all_col_data[row_idx][col_idx] = f"={master_name}!E{master_row}&\" / \"&{master_name}!F{master_row}"
+            elif row_idx in ref_map:
+                # ✅ 작은따옴표 없이 시트명 직접 사용
+                all_col_data[row_idx][col_idx] = f"={master_name}!{ref_map[row_idx]}{master_row}"
 
     end_col = col_num_to_letter(len(data_rows) + 1)
     ws.update(f'B1:{end_col}{len(row_labels)}', all_col_data)
