@@ -18,6 +18,14 @@ all_data = ws_original.get_all_values()
 data_rows = [r for r in all_data[1:] if len(r) > 1 and r[1].strip().startswith('KR')]
 print(f"📋 총 {len(data_rows)}개 종목 확인")
 
+def col_num_to_letter(n):
+    """열 번호(1부터)를 엑셀 열 문자로 변환. 예: 1→A, 26→Z, 27→AA"""
+    result = ''
+    while n > 0:
+        n, remainder = divmod(n - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
 # ── 시트2: 가로형 ─────────────────────────────────────
 def create_horizontal_sheet():
     try:
@@ -217,50 +225,54 @@ def create_vertical_sheet():
     # A열 항목명 입력
     ws.update('A1', [[label] for label in row_labels])
 
-    # B열부터 종목별 데이터
-    for col_idx, r in enumerate(data_rows):
-        col_num = col_idx + 2
-        col_letter = chr(ord('A') + col_num - 1) if col_num <= 26 else f'A{chr(ord("A") + col_num - 27)}'
+    # ✅ 종목별 데이터를 한번에 모아서 업데이트 (열 문자 버그 수정)
+    all_col_data = [[''] * len(data_rows) for _ in range(len(row_labels))]
 
-        col_data = [
-            [''],
-            [r[0] if len(r) > 0 else ''],
-            [r[1] if len(r) > 1 else ''],
-            [r[2] if len(r) > 2 else ''],
-            [r[3] if len(r) > 3 else ''],
-            [''],  # 신용등급 수기
-            [''],  # 보유고객 수기
-            [''],
-            [''],
-            [r[5] if len(r) > 5 else ''],
-            [''],  # Coupon
-            [''],  # YTM
-            [''],
-            [''],
-            [''],  # 권리청구 시작일
-            [''],  # 권리청구 종료일
-            [''],
-            [''],
-            [r[4] if len(r) > 4 else ''],
-            [''],  # 리픽싱 플로어
-            [''],  # Refixing
-            [''],
-            [''],
-            [''],  # PUT 시작일
-            [''],  # PUT 종료일
-            [''],  # PUT 상환지급일
-            [''],  # YTP
-            [''],
-            [''],
-            [''],  # CALL 비율
-            [''],  # CALL 시작일
-            [''],  # CALL 종료일
-            [''],  # YTC
-            [''],
-            [''],  # 주간사 수기
-            [''],  # 특이사항 수기
+    for col_idx, r in enumerate(data_rows):
+        values = [
+            '',
+            r[0] if len(r) > 0 else '',
+            r[1] if len(r) > 1 else '',
+            r[2] if len(r) > 2 else '',
+            r[3] if len(r) > 3 else '',
+            '',  # 신용등급 수기
+            '',  # 보유고객 수기
+            '',
+            '',
+            r[5] if len(r) > 5 else '',
+            '',  # Coupon
+            '',  # YTM
+            '',
+            '',
+            '',  # 권리청구 시작일
+            '',  # 권리청구 종료일
+            '',
+            '',
+            r[4] if len(r) > 4 else '',
+            '',  # 리픽싱 플로어
+            '',  # Refixing
+            '',
+            '',
+            '',  # PUT 시작일
+            '',  # PUT 종료일
+            '',  # PUT 상환지급일
+            '',  # YTP
+            '',
+            '',
+            '',  # CALL 비율
+            '',  # CALL 시작일
+            '',  # CALL 종료일
+            '',  # YTC
+            '',
+            '',  # 주간사 수기
+            '',  # 특이사항 수기
         ]
-        ws.update(f'{col_letter}1', col_data)
+        for row_idx, val in enumerate(values):
+            all_col_data[row_idx][col_idx] = val
+
+    # B열부터 데이터 일괄 업데이트
+    end_col = col_num_to_letter(len(data_rows) + 1)
+    ws.update(f'B1:{end_col}{len(row_labels)}', all_col_data)
 
     total_cols = len(data_rows) + 1
     requests = []
