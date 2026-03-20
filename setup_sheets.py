@@ -3,7 +3,6 @@ import json
 import gspread
 from google.oauth2.service_account import Credentials
 
-# --- [설정] ---
 SHEET_ID = '1s73BDNtCPe5mOs9EjBE5npEfcaNtYRyWJxRBUmJI-WA'
 
 creds_json = json.loads(os.environ.get('GCP_SERVICE_ACCOUNT_KEY'))
@@ -19,10 +18,12 @@ def col_num_to_letter(n):
         result = chr(65 + remainder) + result
     return result
 
-# ── 시트1 헤더 정리 ───────────────────────────────────
+def ref(sheet_name, col, row):
+    """올바른 시트 참조 수식 생성"""
+    return f"='{sheet_name}'!{col}{row}"
+
 def fix_master_sheet():
     ws = sh.get_worksheet(0)
-
     headers = [
         '종목명', '예탁원 종목코드', '회차', '종류',
         '발행일', '만기일', 'Coupon', 'YTM',
@@ -45,20 +46,7 @@ def fix_master_sheet():
             r[3] if len(r) > 3 else '',
             r[4] if len(r) > 4 else '',
             r[5] if len(r) > 5 else '',
-            '',  # G: Coupon
-            '',  # H: YTM
-            '',  # I: 행사가액
-            '',  # J: 리픽싱 플로어
-            '',  # K: 권리청구 시작일
-            '',  # L: 권리청구 종료일
-            '',  # M: PUT 시작일
-            '',  # N: PUT 종료일
-            '',  # O: PUT 상환지급일
-            '',  # P: YTP
-            '',  # Q: CALL 비율
-            '',  # R: CALL 시작일
-            '',  # S: CALL 종료일
-            '',  # T: YTC
+            '', '', '', '', '', '', '', '', '', '', '', '', '', '',
         ]
         new_data.append(row)
 
@@ -66,8 +54,6 @@ def fix_master_sheet():
         ws.update('A2', new_data)
 
     requests = []
-
-    # 헤더 서식
     requests.append({'repeatCell': {
         'range': {'sheetId': ws.id, 'startRowIndex': 0, 'endRowIndex': 1,
                   'startColumnIndex': 0, 'endColumnIndex': len(headers)},
@@ -80,26 +66,20 @@ def fix_master_sheet():
         }},
         'fields': 'userEnteredFormat'
     }})
-
-    # 1행 고정
     requests.append({'updateSheetProperties': {
         'properties': {'sheetId': ws.id, 'gridProperties': {'frozenRowCount': 1}},
         'fields': 'gridProperties.frozenRowCount'
     }})
-
-    # 열 너비
     col_widths = [100,130,50,60,90,90,70,70,80,80,100,100,100,100,110,70,70,100,100,70]
     for i, w in enumerate(col_widths):
         requests.append({'updateDimensionProperties': {
             'range': {'sheetId': ws.id, 'dimension': 'COLUMNS', 'startIndex': i, 'endIndex': i+1},
             'properties': {'pixelSize': w}, 'fields': 'pixelSize'
         }})
-
     sh.batch_update({'requests': requests})
     print(f"✅ 시트1 헤더 정리 완료 ({len(new_data)}개 종목)")
-    return ws, data_rows
+    return ws
 
-# ── 시트2: 가로형 ─────────────────────────────────────
 def create_horizontal_sheet(master_ws):
     try:
         sh.del_worksheet(sh.worksheet('📊 가로형'))
@@ -107,7 +87,7 @@ def create_horizontal_sheet(master_ws):
         pass
 
     ws = sh.add_worksheet(title='📊 가로형', rows=200, cols=30)
-    master_name = master_ws.title  # '시트1'
+    mn = master_ws.title
 
     headers_row1 = [
         '기본정보', '', '', '',
@@ -117,7 +97,6 @@ def create_horizontal_sheet(master_ws):
         'CALL (매도청구권)', '', '', '',
         '수기입력', '', '',
     ]
-
     headers_row2 = [
         '종목명', 'ISIN', '회차', '종류',
         '발행일', '만기일',
@@ -130,13 +109,12 @@ def create_horizontal_sheet(master_ws):
     all_data = master_ws.get_all_values()
     data_count = len([r for r in all_data[1:] if len(r) > 1 and r[1].strip().startswith('KR')])
 
-    # ✅ 시트 이름에 따옴표 없이 수식 생성
     ref_cols = {
-        0: 'A', 1: 'B', 2: 'C', 3: 'D',
-        4: 'E', 5: 'F',
-        6: 'G', 7: 'H', 8: 'I',
-        9: 'M', 10: 'N', 11: 'O', 12: 'P',
-        13: 'Q', 14: 'R', 15: 'S', 16: 'T',
+        0:'A', 1:'B', 2:'C', 3:'D',
+        4:'E', 5:'F',
+        6:'G', 7:'H', 8:'I',
+        9:'M', 10:'N', 11:'O', 12:'P',
+        13:'Q', 14:'R', 15:'S', 16:'T',
     }
 
     formula_rows = []
@@ -145,8 +123,7 @@ def create_horizontal_sheet(master_ws):
         row = []
         for col_idx in range(20):
             if col_idx in ref_cols:
-                # ✅ 작은따옴표 없이 시트명 직접 사용
-                row.append(f"={master_name}!{ref_cols[col_idx]}{master_row}")
+                row.append(ref(mn, ref_cols[col_idx], master_row))
             else:
                 row.append('')
         formula_rows.append(row)
@@ -160,7 +137,6 @@ def create_horizontal_sheet(master_ws):
     total_cols = len(headers_row2)
     requests = []
 
-    # 1행 병합
     merge_ranges = [(0,3),(4,5),(6,8),(9,12),(13,16),(17,19)]
     for sc, ec in merge_ranges:
         if sc != ec:
@@ -170,7 +146,6 @@ def create_horizontal_sheet(master_ws):
                 'mergeType': 'MERGE_ALL'
             }})
 
-    # 헤더 색상
     group_colors = [
         ((0,3),  {'red':0.2,'green':0.4,'blue':0.7}),
         ((4,5),  {'red':0.2,'green':0.6,'blue':0.4}),
@@ -195,29 +170,22 @@ def create_horizontal_sheet(master_ws):
                 'fields': 'userEnteredFormat'
             }})
 
-    # 수기입력 열 노란색
     requests.append({'repeatCell': {
         'range': {'sheetId': ws.id, 'startRowIndex': 2, 'endRowIndex': total_rows,
                   'startColumnIndex': 17, 'endColumnIndex': 20},
         'cell': {'userEnteredFormat': {'backgroundColor': {'red':1.0,'green':1.0,'blue':0.8}}},
         'fields': 'userEnteredFormat.backgroundColor'
     }})
-
-    # 행 높이
     requests.append({'updateDimensionProperties': {
         'range': {'sheetId': ws.id, 'dimension': 'ROWS', 'startIndex': 0, 'endIndex': 2},
         'properties': {'pixelSize': 45}, 'fields': 'pixelSize'
     }})
-
-    # 열 너비
     col_widths = [100,130,50,60,90,90,70,70,80,100,100,110,70,70,100,100,70,70,160,160]
     for i, w in enumerate(col_widths):
         requests.append({'updateDimensionProperties': {
             'range': {'sheetId': ws.id, 'dimension': 'COLUMNS', 'startIndex': i, 'endIndex': i+1},
             'properties': {'pixelSize': w}, 'fields': 'pixelSize'
         }})
-
-    # 테두리
     requests.append({'updateBorders': {
         'range': {'sheetId': ws.id, 'startRowIndex': 0, 'endRowIndex': total_rows,
                   'startColumnIndex': 0, 'endColumnIndex': total_cols},
@@ -228,17 +196,13 @@ def create_horizontal_sheet(master_ws):
         'left':   {'style':'SOLID','width':2,'color':{'red':0.3,'green':0.3,'blue':0.3}},
         'right':  {'style':'SOLID','width':2,'color':{'red':0.3,'green':0.3,'blue':0.3}},
     }})
-
-    # 2행 고정
     requests.append({'updateSheetProperties': {
         'properties': {'sheetId': ws.id, 'gridProperties': {'frozenRowCount': 2}},
         'fields': 'gridProperties.frozenRowCount'
     }})
-
     sh.batch_update({'requests': requests})
     print("✅ 가로형 시트 생성 완료")
 
-# ── 시트3: 세로형 ─────────────────────────────────────
 def create_vertical_sheet(master_ws):
     try:
         sh.del_worksheet(sh.worksheet('📋 세로형'))
@@ -246,66 +210,26 @@ def create_vertical_sheet(master_ws):
         pass
 
     ws = sh.add_worksheet(title='📋 세로형', rows=40, cols=200)
-    master_name = master_ws.title  # '시트1'
+    mn = master_ws.title
 
     row_labels = [
-        '기본정보',
-        '종목명',
-        'ISIN',
-        '회차',
-        '종류',
-        '신용등급',
-        '보유고객 (펀드명)',
-        '',
-        '발행 / 만기',
-        '발행일 / 만기일',
-        'Coupon',
-        'YTM',
-        '',
-        '행사가액',
-        '행사가액',
-        '리픽싱 플로어',
-        '',
-        '권리청구기간',
-        '시작일',
-        '종료일',
-        '',
-        '조기상환 (PUT)',
-        'PUT 시작일',
-        'PUT 종료일',
-        'PUT 상환지급일',
-        'YTP',
-        '',
-        '매도청구권 (CALL)',
-        'CALL 비율',
-        'CALL 시작일',
-        'CALL 종료일',
-        'YTC',
-        '',
-        '주간사 / 소싱 / 실무자',
-        '특이사항 / 보유비율',
+        '기본정보', '종목명', 'ISIN', '회차', '종류',
+        '신용등급', '보유고객 (펀드명)', '',
+        '발행 / 만기', '발행일 / 만기일', 'Coupon', 'YTM', '',
+        '행사가액', '행사가액', '리픽싱 플로어', '',
+        '권리청구기간', '시작일', '종료일', '',
+        '조기상환 (PUT)', 'PUT 시작일', 'PUT 종료일', 'PUT 상환지급일', 'YTP', '',
+        '매도청구권 (CALL)', 'CALL 비율', 'CALL 시작일', 'CALL 종료일', 'YTC', '',
+        '주간사 / 소싱 / 실무자', '특이사항 / 보유비율',
     ]
 
-    # 시트1 참조 매핑 (행 인덱스 → 시트1 열)
     ref_map = {
-        1:  'A',  # 종목명
-        2:  'B',  # ISIN
-        3:  'C',  # 회차
-        4:  'D',  # 종류
-        10: 'G',  # Coupon
-        11: 'H',  # YTM
-        14: 'I',  # 행사가액
-        15: 'J',  # 리픽싱 플로어
-        18: 'K',  # 권리청구 시작일
-        19: 'L',  # 권리청구 종료일
-        22: 'M',  # PUT 시작일
-        23: 'N',  # PUT 종료일
-        24: 'O',  # PUT 상환지급일
-        25: 'P',  # YTP
-        28: 'Q',  # CALL 비율
-        29: 'R',  # CALL 시작일
-        30: 'S',  # CALL 종료일
-        31: 'T',  # YTC
+        1:'A', 2:'B', 3:'C', 4:'D',
+        10:'G', 11:'H',
+        14:'I', 15:'J',
+        18:'K', 19:'L',
+        22:'M', 23:'N', 24:'O', 25:'P',
+        28:'Q', 29:'R', 30:'S', 31:'T',
     }
 
     ws.update('A1', [[label] for label in row_labels])
@@ -319,11 +243,10 @@ def create_vertical_sheet(master_ws):
         master_row = col_idx + 2
         for row_idx in range(len(row_labels)):
             if row_idx == 9:
-                # ✅ 발행일 / 만기일 합쳐서 표시
-                all_col_data[row_idx][col_idx] = f"={master_name}!E{master_row}&\" / \"&{master_name}!F{master_row}"
+                # 발행일 / 만기일 합치기
+                all_col_data[row_idx][col_idx] = f"='{mn}'!E{master_row}&\" / \"&'{mn}'!F{master_row}"
             elif row_idx in ref_map:
-                # ✅ 작은따옴표 없이 시트명 직접 사용
-                all_col_data[row_idx][col_idx] = f"={master_name}!{ref_map[row_idx]}{master_row}"
+                all_col_data[row_idx][col_idx] = ref(mn, ref_map[row_idx], master_row)
 
     end_col = col_num_to_letter(len(data_rows) + 1)
     ws.update(f'B1:{end_col}{len(row_labels)}', all_col_data)
@@ -331,7 +254,6 @@ def create_vertical_sheet(master_ws):
     total_cols = len(data_rows) + 1
     requests = []
 
-    # 열 너비
     requests.append({'updateDimensionProperties': {
         'range': {'sheetId': ws.id, 'dimension': 'COLUMNS', 'startIndex': 0, 'endIndex': 1},
         'properties': {'pixelSize': 160}, 'fields': 'pixelSize'
@@ -341,7 +263,6 @@ def create_vertical_sheet(master_ws):
         'properties': {'pixelSize': 190}, 'fields': 'pixelSize'
     }})
 
-    # 섹션 헤더 색상
     section_rows = [0, 8, 13, 17, 21, 27]
     section_colors = [
         {'red':0.2,'green':0.4,'blue':0.7},
@@ -363,7 +284,6 @@ def create_vertical_sheet(master_ws):
             'fields': 'userEnteredFormat'
         }})
 
-    # 수기입력 행 노란색
     for row_idx in [5, 6, 33, 34]:
         requests.append({'repeatCell': {
             'range': {'sheetId': ws.id, 'startRowIndex': row_idx, 'endRowIndex': row_idx+1,
@@ -372,13 +292,10 @@ def create_vertical_sheet(master_ws):
             'fields': 'userEnteredFormat.backgroundColor'
         }})
 
-    # A열 고정
     requests.append({'updateSheetProperties': {
         'properties': {'sheetId': ws.id, 'gridProperties': {'frozenColumnCount': 1}},
         'fields': 'gridProperties.frozenColumnCount'
     }})
-
-    # 테두리
     requests.append({'updateBorders': {
         'range': {'sheetId': ws.id, 'startRowIndex': 0, 'endRowIndex': len(row_labels),
                   'startColumnIndex': 0, 'endColumnIndex': total_cols},
@@ -389,14 +306,12 @@ def create_vertical_sheet(master_ws):
         'left':   {'style':'SOLID','width':2,'color':{'red':0.3,'green':0.3,'blue':0.3}},
         'right':  {'style':'SOLID','width':2,'color':{'red':0.3,'green':0.3,'blue':0.3}},
     }})
-
     sh.batch_update({'requests': requests})
     print("✅ 세로형 시트 생성 완료")
 
 
-# 실행
 print("🔧 시트 정리 시작...")
-master_ws, _ = fix_master_sheet()
+master_ws = fix_master_sheet()
 create_horizontal_sheet(master_ws)
 create_vertical_sheet(master_ws)
 print("\n🏁 완료!")
