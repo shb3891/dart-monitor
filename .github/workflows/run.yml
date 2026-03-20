@@ -19,30 +19,10 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: |
-          pip install gspread google-auth requests
+        run: pip install gspread google-auth requests
 
       - name: Run Monitoring Bot
         env:
           GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
           DART_API_KEY: ${{ secrets.DART_API_KEY }}
         run: python main.py
-```
-
----
-
-**② main.py 수정**
-```
-dart-monitor 레포 → main.py 클릭
-→ 연필(✏️) 클릭
-→ 전체 지우고 제가 드린 최신 main.py 내용으로 교체
-→ "Commit changes" 클릭
-```
-
----
-
-**③ 수동 실행**
-```
-Actions 탭 → 왼쪽 "Hourly Dart Monitor" 클릭
-→ 오른쪽 "Run workflow" 버튼 클릭
-→ 로그 확인
