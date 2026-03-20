@@ -14,15 +14,18 @@ SEIBRO_KEY = os.environ.get('SEIBRO_KEY', 'e1e03a31bc0583fc0c853d4c41a0dc018dc4d
 SHEET_ID   = os.environ.get('SHEET_ID',   '1s73BDNtCPe5mOs9EjBE5npEfcaNtYRyWJxRBUmJI-WA')
 
 # ============================================================
-# [API 승인 플래그] 승인 나면 True로 변경
+# [API 승인 플래그]
 # ============================================================
-API_BOND_APPROVED  = True   # ✅ 채권정보 (getBondStatInfo, getBondOptionXrcInfo, getIntPayInfo)
-API_STOCK_APPROVED = False  # ⏳ 주식정보 (getXrcStkStatInfo, getXrcStkOptionXrcInfo)
+API_BOND_APPROVED       = True   # ✅ 채권정보
+API_STOCK_APPROVED      = True   # ✅ 주식정보 (방금 승인)
+API_DERIV_APPROVED      = True   # ✅ 파생결합증권정보 (방금 승인)
+API_CORP_APPROVED       = True   # ✅ 기업정보 (방금 승인)
+API_FOREIGN_APPROVED    = True   # ✅ 외화증권정보 (방금 승인)
 
 # ============================================================
 # [테스트 모드]
 # ============================================================
-TEST_MODE = False  # True면 상위 3개만 실행
+TEST_MODE = False
 
 # ============================================================
 # [Google Sheets 연결]
@@ -44,7 +47,6 @@ BASE_URL = "https://seibro.or.kr/OpenPlatform/callOpenAPI.jsp"
 # [공통 유틸]
 # ============================================================
 def seibro_api(api_id, params_dict):
-    """SEIBRO OpenAPI 호출 공통 함수"""
     params_str = ','.join([f"{k}:{v}" for k, v in params_dict.items()])
     full_url   = f"{BASE_URL}?key={SEIBRO_KEY}&apiId={api_id}&params={params_str}"
     try:
@@ -86,7 +88,6 @@ def seibro_api(api_id, params_dict):
 
 
 def get_attr(element, tag):
-    """XML 엘리먼트에서 value 속성 추출"""
     el = element.find(f'.//{tag}')
     if el is not None:
         return el.get('value', '')
@@ -94,15 +95,23 @@ def get_attr(element, tag):
 
 
 def format_date(raw):
-    """YYYYMMDD → YYYY-MM-DD 변환"""
     raw = str(raw).strip() if raw else ''
     if len(raw) == 8 and raw.isdigit():
         return f"{raw[:4]}-{raw[4:6]}-{raw[6:]}"
     return raw or '-'
 
 
+def fmt_number(val):
+    """숫자 문자열에 콤마 포맷 (0이면 빈칸)"""
+    if not val or val == '0':
+        return ''
+    try:
+        return f"{int(float(val)):,}"
+    except Exception:
+        return val
+
+
 def extract_hosu(nm):
-    """종목명에서 회차 추출"""
     m = re.search(r'제\s*(\d+)\s*회', nm or '')
     if m:
         return m.group(1)
@@ -116,7 +125,6 @@ def extract_hosu(nm):
 
 
 def extract_corp_name(nm):
-    """종목명에서 회사명 추출"""
     m = re.match(r'([가-힣a-zA-Z\s]+?)\s*\d+\s*(?:CB|EB|BW)', nm or '')
     if m:
         return m.group(1).strip()
@@ -124,7 +132,6 @@ def extract_corp_name(nm):
 
 
 def determine_bond_type(secn_nm):
-    """종목명에서 CB/EB/BW 구분"""
     nm = secn_nm or ''
     if 'EB' in nm or '교환' in nm:
         return 'EB'
@@ -136,14 +143,11 @@ def determine_bond_type(secn_nm):
 
 
 # ============================================================
-# [파싱 함수들] API별로 분리
+# [파싱 함수들]
 # ============================================================
 
 def parse_bond_basic(isin):
-    """
-    getBondStatInfo → A(종목명), C(회차), D(종류), E(발행일), F(만기일), G(Coupon)
-    ✅ 채권API 승인됨
-    """
+    """getBondStatInfo → A(종목명), C(회차), D(종류), E(발행일), F(만기일), G(Coupon)"""
     root = seibro_api('getBondStatInfo', {'ISIN': isin})
     if root is None:
         return None
@@ -159,9 +163,7 @@ def parse_bond_basic(isin):
     bond_type   = determine_bond_type(secn_nm)
     hosu        = extract_hosu(secn_nm)
     corp_name   = extract_corp_name(secn_nm)
-
-    # Coupon: 0이면 빈칸 처리
-    coupon = coupon_rate if coupon_rate and coupon_rate != '0' else ''
+    coupon      = coupon_rate if coupon_rate and coupon_rate != '0' else ''
 
     return {
         'corp_name': corp_name,
@@ -174,11 +176,7 @@ def parse_bond_basic(isin):
 
 
 def parse_put_call(isin):
-    """
-    getBondOptionXrcInfo → M(PUT시작일), N(PUT종료일), O(PUT상환지급일), Q(CALL비율), R(CALL시작일), S(CALL종료일)
-    OPTION_TPCD: 9401=CALL, 9402=PUT, 9403=CALL+PUT
-    ✅ 채권API 승인됨 — 단, 조기상환 이력이 없는 종목은 빈값 반환
-    """
+    """getBondOptionXrcInfo → M(PUT시작일), N(PUT종료일), O(PUT상환지급일), Q(CALL비율), R(CALL시작일), S(CALL종료일)"""
     root = seibro_api('getBondOptionXrcInfo', {'ISIN': isin})
 
     result = {
@@ -200,12 +198,12 @@ def parse_put_call(isin):
         erly_red_dt = format_date(get_attr(result_el, 'ERLY_RED_DT'))
         xrc_ratio   = get_attr(result_el, 'XRC_RATIO')
 
-        if option_tpcd in ('9402', '9403'):  # PUT 또는 CALL+PUT
+        if option_tpcd in ('9402', '9403'):
             result['put_begin'] = result['put_begin'] or xrc_begin
             result['put_end']   = result['put_end']   or xrc_end
             result['put_date']  = result['put_date']  or erly_red_dt
 
-        if option_tpcd in ('9401', '9403'):  # CALL 또는 CALL+PUT
+        if option_tpcd in ('9401', '9403'):
             result['call_begin'] = result['call_begin'] or xrc_begin
             result['call_end']   = result['call_end']   or xrc_end
             result['call_ratio'] = result['call_ratio'] or xrc_ratio
@@ -215,30 +213,25 @@ def parse_put_call(isin):
 
 def parse_exercise_info(isin):
     """
-    getXrcStkStatInfo  → I(행사가액)
+    getXrcStkStatInfo      → I(행사가액), J(리픽싱플로어)  ✅ 주식API 승인됨
     getXrcStkOptionXrcInfo → K(권리청구시작일), L(권리청구종료일)
-    ⏳ 주식API 승인 대기 중
     """
     result = {
-        'xrc_price':      '',
-        'xrc_begin':      '',
-        'xrc_end':        '',
+        'xrc_price':   '',
+        'rfxg_floor':  '',   # ← J열 리픽싱플로어 추가
+        'xrc_begin':   '',
+        'xrc_end':     '',
     }
 
-    # --- 행사가액: getXrcStkStatInfo ---
+    # --- 행사가액 + 리픽싱플로어: getXrcStkStatInfo ---
     root = seibro_api('getXrcStkStatInfo', {'BOND_ISIN': isin})
     if root is not None:
         result_el = root.find('.//result')
         if result_el is not None:
-            price = get_attr(result_el, 'XRC_PRICE')
-            if price and price != '0':
-                # 숫자에 콤마 포맷 적용
-                try:
-                    result['xrc_price'] = f"{int(float(price)):,}"
-                except Exception:
-                    result['xrc_price'] = price
+            result['xrc_price']  = fmt_number(get_attr(result_el, 'XRC_PRICE'))
+            result['rfxg_floor'] = fmt_number(get_attr(result_el, 'RFXG_FLOOR_PRICE'))
 
-    # --- 권리청구기간: getXrcStkOptionXrcInfo (가장 초기 행사시작일 / 가장 최근 행사종료일) ---
+    # --- 권리청구기간: getXrcStkOptionXrcInfo ---
     root2 = seibro_api('getXrcStkOptionXrcInfo', {'BOND_ISIN': isin})
     if root2 is not None:
         begin_dates = []
@@ -259,22 +252,12 @@ def parse_exercise_info(isin):
 
 
 # ============================================================
-# [메인 오케스트레이터] 종목 1개의 모든 데이터 수집
+# [메인 오케스트레이터]
 # ============================================================
 def get_mezzanine_data(isin, existing_row):
-    """
-    ISIN 1개에 대해 모든 API 호출 후 시트 업데이트용 데이터 반환
-    반환: {
-        'corp_name': str,
-        'basic_row': [회차, 종류, 발행일, 만기일],   → C~F
-        'coupon':    str,                            → G
-        'put_call':  dict,                           → M~N, O, Q~S
-        'exercise':  dict,                           → I, K, L
-    }
-    """
     print(f"  🔍 {isin}", end=' ')
 
-    # --- 기본정보 (✅ 항상 실행) ---
+    # 기본정보
     basic = parse_bond_basic(isin)
     if basic:
         print(f"→ {basic['corp_name']} {basic['hosu']}회 {basic['bond_type']}", end=' ')
@@ -292,18 +275,18 @@ def get_mezzanine_data(isin, existing_row):
         ]
         coupon = existing_row[6].strip() if len(existing_row) > 6 else ''
 
-    # --- PUT/CALL (✅ 채권API 승인됨) ---
+    # PUT/CALL
     put_call = parse_put_call(isin) if API_BOND_APPROVED else {
         'put_begin': '', 'put_end': '', 'put_date': '',
         'call_ratio': '', 'call_begin': '', 'call_end': '',
     }
 
-    # --- 행사가액·권리청구기간 (⏳ 주식API 승인 대기) ---
+    # 행사가액·리픽싱플로어·권리청구기간
     exercise = parse_exercise_info(isin) if API_STOCK_APPROVED else {
-        'xrc_price': '', 'xrc_begin': '', 'xrc_end': '',
+        'xrc_price': '', 'rfxg_floor': '', 'xrc_begin': '', 'xrc_end': '',
     }
 
-    print()  # 줄바꿈
+    print()
     return {
         'corp_name': corp_name,
         'basic_row': basic_row,
@@ -336,98 +319,83 @@ async def main():
         print("⚠ 데이터 없음. 종료.")
         return
 
-    # 결과 수집
     results = []
     for sheet_row, row in data_rows:
         isin   = row[1].strip()
         result = get_mezzanine_data(isin, row)
         results.append((sheet_row, result))
-        await asyncio.sleep(1.0)  # API rate limit
+        await asyncio.sleep(1.0)
 
     # --------------------------------------------------------
-    # 시트 업데이트 (컬럼별 배치)
+    # 시트 업데이트
     # --------------------------------------------------------
     print("\n📝 시트 업데이트 중...")
+    first_row = results[0][0]
+    last_row  = results[-1][0]
 
     # A열: 종목명
-    a_updates = [[r['corp_name']] for _, r in results]
-    worksheet.update(
-        range_name=f"A{results[0][0]}:A{results[-1][0]}",
-        values=a_updates
-    )
+    worksheet.update(f"A{first_row}:A{last_row}", [[r['corp_name']] for _, r in results])
     await asyncio.sleep(1.0)
 
     # C~F열: 회차, 종류, 발행일, 만기일
-    cf_updates = [r['basic_row'] for _, r in results]
-    worksheet.update(
-        range_name=f"C{results[0][0]}:F{results[-1][0]}",
-        values=cf_updates
-    )
+    worksheet.update(f"C{first_row}:F{last_row}", [r['basic_row'] for _, r in results])
     await asyncio.sleep(1.0)
 
     # G열: Coupon
-    g_updates = [[r['coupon']] for _, r in results]
-    worksheet.update(
-        range_name=f"G{results[0][0]}:G{results[-1][0]}",
-        values=g_updates
-    )
+    worksheet.update(f"G{first_row}:G{last_row}", [[r['coupon']] for _, r in results])
     await asyncio.sleep(1.0)
 
-    # I열: 행사가액 (주식API 승인 후 활성화)
+    # I열: 행사가액
     if API_STOCK_APPROVED:
-        i_updates = [[r['exercise']['xrc_price']] for _, r in results]
-        worksheet.update(
-            range_name=f"I{results[0][0]}:I{results[-1][0]}",
-            values=i_updates
-        )
+        worksheet.update(f"I{first_row}:I{last_row}", [[r['exercise']['xrc_price']] for _, r in results])
         await asyncio.sleep(1.0)
 
-    # K~L열: 권리청구 시작일, 종료일 (주식API 승인 후 활성화)
+    # J열: 리픽싱플로어  ← 신규 추가
     if API_STOCK_APPROVED:
-        kl_updates = [
-            [r['exercise']['xrc_begin'], r['exercise']['xrc_end']]
-            for _, r in results
-        ]
+        worksheet.update(f"J{first_row}:J{last_row}", [[r['exercise']['rfxg_floor']] for _, r in results])
+        await asyncio.sleep(1.0)
+
+    # K~L열: 권리청구 시작일, 종료일
+    if API_STOCK_APPROVED:
         worksheet.update(
-            range_name=f"K{results[0][0]}:L{results[-1][0]}",
-            values=kl_updates
+            f"K{first_row}:L{last_row}",
+            [[r['exercise']['xrc_begin'], r['exercise']['xrc_end']] for _, r in results]
         )
         await asyncio.sleep(1.0)
 
     # M~O열: PUT 시작일, 종료일, 상환지급일
     if API_BOND_APPROVED:
-        mo_updates = [
-            [r['put_call']['put_begin'], r['put_call']['put_end'], r['put_call']['put_date']]
-            for _, r in results
-        ]
         worksheet.update(
-            range_name=f"M{results[0][0]}:O{results[-1][0]}",
-            values=mo_updates
+            f"M{first_row}:O{last_row}",
+            [[r['put_call']['put_begin'], r['put_call']['put_end'], r['put_call']['put_date']] for _, r in results]
         )
         await asyncio.sleep(1.0)
 
     # Q~S열: CALL 비율, 시작일, 종료일
     if API_BOND_APPROVED:
-        qs_updates = [
-            [r['put_call']['call_ratio'], r['put_call']['call_begin'], r['put_call']['call_end']]
-            for _, r in results
-        ]
         worksheet.update(
-            range_name=f"Q{results[0][0]}:S{results[-1][0]}",
-            values=qs_updates
+            f"Q{first_row}:S{last_row}",
+            [[r['put_call']['call_ratio'], r['put_call']['call_begin'], r['put_call']['call_end']] for _, r in results]
         )
         await asyncio.sleep(1.0)
 
+    # --------------------------------------------------------
+    # 완료 리포트
+    # --------------------------------------------------------
     print(f"\n🏁 완료! {len(results)}개 종목 업데이트됨")
     print(f"👉 https://docs.google.com/spreadsheets/d/{SHEET_ID}")
-    print(f"\n📌 현재 업데이트 현황:")
-    print(f"  ✅ A열  종목명")
-    print(f"  ✅ C~F열 회차·종류·발행일·만기일")
-    print(f"  ✅ G열  Coupon")
-    print(f"  {'✅' if API_BOND_APPROVED else '⏳'} M~O열 PUT 정보")
-    print(f"  {'✅' if API_BOND_APPROVED else '⏳'} Q~S열 CALL 정보")
-    print(f"  {'✅' if API_STOCK_APPROVED else '⏳'} I열   행사가액")
-    print(f"  {'✅' if API_STOCK_APPROVED else '⏳'} K~L열 권리청구기간")
+    print(f"\n📌 업데이트 현황:")
+    print(f"  ✅ A열    종목명")
+    print(f"  ✅ C~F열  회차·종류·발행일·만기일")
+    print(f"  ✅ G열    Coupon")
+    print(f"  ✅ I열    행사가액")
+    print(f"  ✅ J열    리픽싱플로어  ← 신규")
+    print(f"  ✅ K~L열  권리청구기간")
+    print(f"  ✅ M~O열  PUT 정보")
+    print(f"  ✅ Q~S열  CALL 정보")
+    print(f"  ⏳ H열    YTM  (수동 입력 또는 추후)")
+    print(f"  ⏳ P열    YTP  (수동 입력 또는 추후)")
+    print(f"  ⏳ T열    YTC  (수동 입력 또는 추후)")
 
 
 if __name__ == "__main__":
