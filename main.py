@@ -119,23 +119,27 @@ def get_mezzanine_data(isin, existing_row):
 
             print(f"→ {corp_name} {hosu}회 {bond_type} {issu_dt} ~ {xpir_dt}")
 
+            # 새 열 구조: C회차 D종류 E발행일 F만기일 G~ (행사가액은 나중에 I열)
             return {
                 'corp_name': corp_name,
-                'row': [hosu, bond_type, '0', issu_dt, xpir_dt, '-']
+                'row': [
+                    hosu,      # C: 회차
+                    bond_type, # D: 종류
+                    issu_dt,   # E: 발행일
+                    xpir_dt,   # F: 만기일
+                ]
             }
 
-    # ✅ API 실패 시 기존 값 그대로 유지
+    # API 실패 시 기존값 유지
     print(f"→ ⚠ API 없음 (기존값 유지)")
-    existing_corp  = existing_row[0].strip() if len(existing_row) > 0 else '-'
-    existing_hosu  = existing_row[2].strip() if len(existing_row) > 2 else '-'
-    existing_type  = existing_row[3].strip() if len(existing_row) > 3 else '-'
-    existing_price = existing_row[4].strip() if len(existing_row) > 4 else '0'
-    existing_issu  = existing_row[5].strip() if len(existing_row) > 5 else '-'
-    existing_xpir  = existing_row[6].strip() if len(existing_row) > 6 else '-'
-
     return {
-        'corp_name': existing_corp,
-        'row': [existing_hosu, existing_type, existing_price, existing_issu, existing_xpir, '-']
+        'corp_name': existing_row[0].strip() if len(existing_row) > 0 else '-',
+        'row': [
+            existing_row[2].strip() if len(existing_row) > 2 else '-',  # C: 회차
+            existing_row[3].strip() if len(existing_row) > 3 else '-',  # D: 종류
+            existing_row[4].strip() if len(existing_row) > 4 else '-',  # E: 발행일
+            existing_row[5].strip() if len(existing_row) > 5 else '-',  # F: 만기일
+        ]
     }
 
 async def main():
@@ -155,31 +159,32 @@ async def main():
         print(f"🚀 전체 {len(data_rows)}개 종목 실행\n")
 
     a_updates  = []
-    cg_updates = []
+    cf_updates = []
     start_row  = data_rows[0][0] if data_rows else 2
 
     for sheet_row, row in data_rows:
         isin   = row[1].strip()
         result = get_mezzanine_data(isin, row)
         a_updates.append([result['corp_name']])
-        cg_updates.append(result['row'])
+        cf_updates.append(result['row'])
         await asyncio.sleep(1.0)
 
-    if cg_updates:
-        end_row = start_row + len(cg_updates) - 1
+    if cf_updates:
+        end_row = start_row + len(cf_updates) - 1
 
+        # A열: 종목명
         worksheet.update(
             range_name=f"A{start_row}:A{end_row}",
             values=a_updates
         )
         await asyncio.sleep(1.0)
 
-        # ✅ C~H열 (회차/종류/행사가액/발행일/만기일/권리청구시작일)
+        # C~F열: 회차, 종류, 발행일, 만기일
         worksheet.update(
-            range_name=f"C{start_row}:H{end_row}",
-            values=cg_updates
+            range_name=f"C{start_row}:F{end_row}",
+            values=cf_updates
         )
-        print(f"\n🏁 완료! {len(cg_updates)}개 종목 업데이트됨")
+        print(f"\n🏁 완료! {len(cf_updates)}개 종목 업데이트됨")
 
 if __name__ == "__main__":
     asyncio.run(main())
