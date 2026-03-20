@@ -18,7 +18,6 @@ gc = gspread.authorize(creds)
 sh = gc.open_by_key(SHEET_ID)
 worksheet = sh.get_worksheet(0)
 
-# ✅ 전체 종목 실행
 TEST_MODE = False
 
 BASE_URL = "https://seibro.or.kr/OpenPlatform/callOpenAPI.jsp"
@@ -45,13 +44,19 @@ def seibro_api(api_id, params_dict):
 
         root = ET.fromstring(cleaned.encode('utf-8'))
 
+        # 에러 체크
+        error = root.find('.//error')
+        if error is not None:
+            code = error.find('code')
+            if code is not None and code.get('value') not in ('000', '00', ''):
+                return None
+
         vector = root.find('.//vector')
         if vector is None:
             return None
 
         result_count = vector.get('result', '0')
         if result_count == '0':
-            print(f"  ⚠ [{api_id}] 결과 없음: {params_dict}")
             return None
 
         return root
@@ -73,7 +78,6 @@ def format_date(raw):
     return raw or '-'
 
 def extract_hosu(nm):
-    """종목명에서 회차 추출."""
     m = re.search(r'제\s*(\d+)\s*회', nm or '')
     if m:
         return m.group(1)
@@ -86,7 +90,6 @@ def extract_hosu(nm):
     return '-'
 
 def extract_corp_name(nm):
-    """종목명에서 회사명만 추출. 예: 만호제강1EB(사모/교환/풋) → 만호제강"""
     m = re.match(r'([가-힣a-zA-Z\s]+?)\s*\d+\s*(?:CB|EB|BW)', nm or '')
     if m:
         return m.group(1).strip()
@@ -105,12 +108,11 @@ def determine_bond_type(secn_nm):
 def get_mezzanine_data(isin):
     print(f"  🔍 {isin}", end=' ')
 
-    corp_name      = '-'
-    hosu           = '-'
-    bond_type      = '-'
-    xrc_price      = '0'
-    issu_dt        = '-'
-    right_start_dt = '-'
+    corp_name = '-'
+    hosu      = '-'
+    bond_type = '-'
+    issu_dt   = '-'
+    xpir_dt   = '-'  # ✅ 만기일 추가
 
     root = seibro_api('getBondStatInfo', {'ISIN': isin})
     if root is not None:
@@ -118,14 +120,18 @@ def get_mezzanine_data(isin):
         if result_el is not None:
             secn_nm   = get_attr(result_el, 'KOR_SECN_NM')
             issu_dt   = format_date(get_attr(result_el, 'ISSU_DT'))
+            xpir_dt   = format_date(get_attr(result_el, 'XPIR_DT'))  # ✅ 만기일
             bond_type = determine_bond_type(secn_nm)
             hosu      = extract_hosu(secn_nm)
             corp_name = extract_corp_name(secn_nm)
-            print(f"→ {corp_name} {hosu}회 {bond_type} {issu_dt}")
+            print(f"→ {corp_name} {hosu}회 {bond_type} {issu_dt} ~ {xpir_dt}")
+    else:
+        print(f"→ ⚠ 데이터 없음 (수동입력 필요)")
 
+    # [종목명, 회차, 종류, 행사가액, 발행일, 만기일, 권리청구시작일]
     return {
         'corp_name': corp_name,
-        'row': [hosu, bond_type, xrc_price, issu_dt, right_start_dt]
+        'row': [hosu, bond_type, '0', issu_dt, xpir_dt, '-']
     }
 
 async def main():
@@ -151,7 +157,13 @@ async def main():
     for sheet_row, row in data_rows:
         isin   = row[1].strip()
         result = get_mezzanine_data(isin)
-        a_updates.append([result['corp_name']])
+
+        # 데이터 없는 종목은 기존 A열 종목명 유지
+        if result['corp_name'] == '-' and len(row) > 0 and row[0].strip():
+            a_updates.append([row[0].strip()])
+        else:
+            a_updates.append([result['corp_name']])
+
         cg_updates.append(result['row'])
         await asyncio.sleep(1.0)
 
@@ -165,9 +177,9 @@ async def main():
         )
         await asyncio.sleep(1.0)
 
-        # C~G열 업데이트
+        # C~H열 업데이트 (만기일 추가로 G열까지 → H열로 확장)
         worksheet.update(
-            range_name=f"C{start_row}:G{end_row}",
+            range_name=f"C{start_row}:H{end_row}",
             values=cg_updates
         )
         print(f"\n🏁 완료! {len(cg_updates)}개 종목 업데이트됨")
