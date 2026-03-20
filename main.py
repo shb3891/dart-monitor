@@ -36,7 +36,7 @@ API_DART_YTM         = True
 # ============================================================
 # [테스트 / 디버그 모드]
 # ============================================================
-TEST_MODE  = False
+TEST_MODE  = True   # ← 3개만 실행해서 DART 로그 확인
 DEBUG_MODE = False
 
 DEBUG_ISINS = [
@@ -167,7 +167,9 @@ def dart_get_corp_code(stock_code_6):
     try:
         url = f"{DART_BASE}/company.json"
         r = requests.get(url, params={'crtfc_key': DART_KEY, 'stock_code': stock_code_6}, timeout=10)
+        print(f"    🌐 DART company API 응답코드: {r.status_code}")
         data = r.json()
+        print(f"    🌐 DART company API status: {data.get('status')} / message: {data.get('message','')}")
         if data.get('status') == '000':
             corp_code = data.get('corp_code', '')
             print(f"    📌 DART corp_code: {corp_code} ({data.get('corp_name', '')})")
@@ -195,20 +197,24 @@ def dart_search_cb_disclosure(corp_code, issu_dt_str):
         }
         r = requests.get(url, params=params, timeout=10)
         data = r.json()
+        print(f"    🌐 DART list API status: {data.get('status')} / message: {data.get('message','')}")
 
         if data.get('status') not in ('000', '013'):
             print(f"    ⚠ DART 공시목록 조회 실패: {data.get('message', '')}")
             return None
 
         keywords = ['전환사채', '신주인수권', '교환사채']
-        for item in data.get('list', []):
+        items = data.get('list', [])
+        print(f"    📋 공시 목록 {len(items)}건 검색됨 (기간: {bgn_de}~{end_de})")
+        for item in items:
             rpt = item.get('report_nm', '')
+            print(f"       - {rpt}")
             if any(kw in rpt for kw in keywords):
                 rcept_no = item.get('rcept_no')
                 print(f"    📄 DART 공시 발견: {rpt} ({rcept_no})")
                 return rcept_no
 
-        print(f"    ℹ DART 해당 공시 없음 (기간: {bgn_de}~{end_de})")
+        print(f"    ℹ DART 해당 공시 없음")
     except Exception as e:
         print(f"    ⚠ DART 공시검색 실패: {e}")
     return None
@@ -219,8 +225,10 @@ def dart_parse_ytm(rcept_no):
     try:
         url = f"{DART_BASE}/document.xml"
         r = requests.get(url, params={'crtfc_key': DART_KEY, 'rcept_no': rcept_no}, timeout=30)
+        print(f"    🌐 DART document API 응답코드: {r.status_code} / 크기: {len(r.content)} bytes")
 
         z = zipfile.ZipFile(io.BytesIO(r.content))
+        print(f"    📦 ZIP 내 파일 목록: {z.namelist()}")
 
         for fname in z.namelist():
             if not (fname.endswith('.xml') or fname.endswith('.html') or fname.endswith('.htm')):
@@ -240,6 +248,11 @@ def dart_parse_ytm(rcept_no):
             clean = re.sub(r'<[^>]+>', ' ', text)
             clean = re.sub(r'\s+', ' ', clean)
 
+            # 만기이자율 주변 텍스트 출력 (디버깅용)
+            idx = clean.find('만기이자율')
+            if idx >= 0:
+                print(f"    🔎 '만기이자율' 발견 in {fname}: ...{clean[max(0,idx-20):idx+60]}...")
+
             patterns = [
                 r'만기이자율\s*[\(%\s]*([0-9]+(?:\.[0-9]+)?)',
                 r'만기\s*이자율[^0-9]*([0-9]+(?:\.[0-9]+)?)',
@@ -249,7 +262,7 @@ def dart_parse_ytm(rcept_no):
                 m = re.search(pat, clean)
                 if m:
                     val = m.group(1)
-                    print(f"    ✅ 만기이자율 파싱: {val}%")
+                    print(f"    ✅ 만기이자율 파싱 성공: {val}%")
                     return val
 
         print(f"    ℹ 만기이자율 텍스트 미발견")
@@ -263,16 +276,22 @@ def parse_dart_ytm_for_bond(isin, issu_dt_str, xrc_stk_isin):
     if not API_DART_YTM:
         return ''
 
+    print(f"    🔑 DART_KEY 앞6자리: {DART_KEY[:6] if DART_KEY else '없음(빈값)'}")
+    print(f"    📎 xrc_stk_isin: {xrc_stk_isin}")
+
     stock_code_6 = ''
     if xrc_stk_isin and len(xrc_stk_isin) >= 9:
         stock_code_6 = xrc_stk_isin[3:9]
 
+    print(f"    📎 stock_code_6: {stock_code_6}")
+
     if not stock_code_6:
-        print(f"    ⚠ 주식 단축코드 추출 실패: {xrc_stk_isin}")
+        print(f"    ⚠ 주식 단축코드 추출 실패 → DART 조회 중단")
         return ''
 
     corp_code = dart_get_corp_code(stock_code_6)
     if not corp_code:
+        print(f"    ⚠ corp_code 없음 → DART 조회 중단")
         return ''
 
     rcept_no = dart_search_cb_disclosure(corp_code, issu_dt_str)
@@ -418,13 +437,13 @@ def get_mezzanine_data(isin, existing_row):
 
     basic = parse_bond_basic(isin)
     if basic:
-        print(f"→ {basic['corp_name']} {basic['hosu']}회 {basic['bond_type']}", end=' ')
+        print(f"→ {basic['corp_name']} {basic['hosu']}회 {basic['bond_type']}")
         corp_name = basic['corp_name']
         basic_row = [basic['hosu'], basic['bond_type'], basic['issu_dt'], basic['xpir_dt']]
         coupon    = basic['coupon']
         issu_dt   = basic['issu_dt']
     else:
-        print(f"→ ⚠ getBondStatInfo 실패 (기존값 유지)", end=' ')
+        print(f"→ ⚠ getBondStatInfo 실패 (기존값 유지)")
         corp_name = existing_row[0].strip() if len(existing_row) > 0 else '-'
         basic_row = [
             existing_row[2].strip() if len(existing_row) > 2 else '-',
@@ -446,10 +465,11 @@ def get_mezzanine_data(isin, existing_row):
 
     ytm = ''
     if API_DART_YTM and exercise.get('xrc_stk_isin') and issu_dt and issu_dt != '-':
-        print(f"\n    🌐 DART YTM 조회 중...")
+        print(f"    🌐 DART YTM 조회 중... (발행일: {issu_dt})")
         ytm = parse_dart_ytm_for_bond(isin, issu_dt, exercise['xrc_stk_isin'])
+    else:
+        print(f"    ℹ DART YTM 스킵 (xrc_stk_isin={exercise.get('xrc_stk_isin')}, issu_dt={issu_dt})")
 
-    print()
     return {
         'corp_name': corp_name,
         'basic_row': basic_row,
@@ -473,6 +493,7 @@ async def main():
         print("✅ 디버그 완료. DEBUG_MODE = False 로 바꾸고 다시 실행하세요.")
         return
 
+    print(f"🔑 DART_KEY 로드 확인: {DART_KEY[:6] if DART_KEY else '없음'}...")
     print("📋 스프레드시트 읽는 중...")
     all_values = worksheet.get_all_values()
 
@@ -503,28 +524,24 @@ async def main():
     first_row = results[0][0]
     last_row  = results[-1][0]
 
-    # A열: 종목명
     worksheet.update(
         [[r['corp_name']] for _, r in results],
         range_name=f"A{first_row}:A{last_row}"
     )
     await asyncio.sleep(1.0)
 
-    # C~F열: 회차, 종류, 발행일, 만기일
     worksheet.update(
         [r['basic_row'] for _, r in results],
         range_name=f"C{first_row}:F{last_row}"
     )
     await asyncio.sleep(1.0)
 
-    # G열: Coupon
     worksheet.update(
         [[r['coupon']] for _, r in results],
         range_name=f"G{first_row}:G{last_row}"
     )
     await asyncio.sleep(1.0)
 
-    # H열: YTM (DART)
     if API_DART_YTM:
         worksheet.update(
             [[r['ytm']] for _, r in results],
@@ -532,7 +549,6 @@ async def main():
         )
         await asyncio.sleep(1.0)
 
-    # I열: 행사가액
     if API_STOCK_APPROVED:
         worksheet.update(
             [[r['exercise']['xrc_price']] for _, r in results],
@@ -540,7 +556,6 @@ async def main():
         )
         await asyncio.sleep(1.0)
 
-    # K~L열: 권리청구 시작일, 종료일
     if API_STOCK_APPROVED:
         worksheet.update(
             [[r['exercise']['xrc_begin'], r['exercise']['xrc_end']] for _, r in results],
@@ -548,7 +563,6 @@ async def main():
         )
         await asyncio.sleep(1.0)
 
-    # M~O열: PUT 시작일, 종료일, 상환지급일
     if API_BOND_APPROVED:
         worksheet.update(
             [[r['put_call']['put_begin'], r['put_call']['put_end'], r['put_call']['put_date']] for _, r in results],
@@ -556,7 +570,6 @@ async def main():
         )
         await asyncio.sleep(1.0)
 
-    # Q~S열: CALL 비율, 시작일, 종료일
     if API_BOND_APPROVED:
         worksheet.update(
             [[r['put_call']['call_ratio'], r['put_call']['call_begin'], r['put_call']['call_end']] for _, r in results],
@@ -571,12 +584,12 @@ async def main():
     print(f"  ✅ A열    종목명")
     print(f"  ✅ C~F열  회차·종류·발행일·만기일")
     print(f"  ✅ G열    Coupon")
-    print(f"  ✅ H열    YTM  ← DART 연동 ({ytm_count}/{len(results)}개 성공)")
+    print(f"  ✅ H열    YTM ← DART 연동 ({ytm_count}/{len(results)}개 성공)")
     print(f"  ✅ I열    행사가액")
     print(f"  ✅ K~L열  권리청구기간")
     print(f"  ✅ M~O열  PUT 정보")
     print(f"  ✅ Q~S열  CALL 정보")
-    print(f"  ⏳ J열    리픽싱플로어  (추후 DART 연동)")
+    print(f"  ⏳ J열    리픽싱플로어 (추후 DART 연동)")
     print(f"  ⏳ P열    YTP  (추후)")
     print(f"  ⏳ T열    YTC  (추후)")
 
