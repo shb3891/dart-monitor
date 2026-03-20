@@ -36,13 +36,13 @@ API_DART_YTM         = True
 # ============================================================
 # [테스트 / 디버그 모드]
 # ============================================================
-TEST_MODE  = True   # ← 3개만 실행해서 DART 로그 확인
+TEST_MODE  = True   # 확인 후 False로 변경
 DEBUG_MODE = False
 
 DEBUG_ISINS = [
-    "KR6177831E26",  # 파버나인 5회 CB
-    "KR6214271E32",  # FSN 13회 CB
-    "KR6222421DC0",  # 쎄노텍 3회 CB
+    "KR6177831E26",
+    "KR6214271E32",
+    "KR6222421DC0",
 ]
 
 # ============================================================
@@ -60,6 +60,55 @@ worksheet = sh.get_worksheet(0)
 
 SEIBRO_BASE = "https://seibro.or.kr/OpenPlatform/callOpenAPI.jsp"
 DART_BASE   = "https://opendart.fss.or.kr/api"
+
+# ============================================================
+# [DART 기업코드 맵 (전역 캐시)]
+# stock_code(6자리) → corp_code 딕셔너리
+# 최초 1회만 다운로드 후 재사용
+# ============================================================
+_DART_CORP_MAP = {}
+
+def dart_load_corp_map():
+    """
+    DART 전체 기업코드 ZIP 다운로드 → stock_code:corp_code 딕셔너리 생성
+    https://opendart.fss.or.kr/api/corpCode.xml
+    """
+    global _DART_CORP_MAP
+    if _DART_CORP_MAP:
+        return  # 이미 로드됨
+
+    try:
+        print("  📥 DART 기업코드 전체 다운로드 중...")
+        url = f"{DART_BASE}/corpCode.xml"
+        r = requests.get(url, params={'crtfc_key': DART_KEY}, timeout=30)
+        print(f"  📥 응답코드: {r.status_code} / 크기: {len(r.content):,} bytes")
+
+        z = zipfile.ZipFile(io.BytesIO(r.content))
+        xml_data = z.read('CORPCODE.xml')
+        root = ET.fromstring(xml_data)
+
+        count = 0
+        for item in root.findall('.//list'):
+            corp_code  = item.findtext('corp_code', '').strip()
+            stock_code = item.findtext('stock_code', '').strip()
+            if stock_code and len(stock_code) == 6:
+                _DART_CORP_MAP[stock_code] = corp_code
+                count += 1
+
+        print(f"  ✅ DART 기업코드 로드 완료: {count:,}개 (상장사)")
+    except Exception as e:
+        print(f"  ⚠ DART 기업코드 로드 실패: {e}")
+
+
+def dart_get_corp_code(stock_code_6):
+    """stock_code(6자리) → corp_code"""
+    dart_load_corp_map()
+    corp_code = _DART_CORP_MAP.get(stock_code_6, '')
+    if corp_code:
+        print(f"    📌 corp_code: {corp_code} (stock: {stock_code_6})")
+    else:
+        print(f"    ⚠ corp_code 없음 (stock: {stock_code_6})")
+    return corp_code
 
 
 # ============================================================
@@ -160,25 +209,8 @@ def determine_bond_type(secn_nm):
 
 
 # ============================================================
-# [DART API 유틸]
+# [DART API - 공시 검색 및 YTM 파싱]
 # ============================================================
-def dart_get_corp_code(stock_code_6):
-    """6자리 주식 단축코드 → DART corp_code"""
-    try:
-        url = f"{DART_BASE}/company.json"
-        r = requests.get(url, params={'crtfc_key': DART_KEY, 'stock_code': stock_code_6}, timeout=10)
-        print(f"    🌐 DART company API 응답코드: {r.status_code}")
-        data = r.json()
-        print(f"    🌐 DART company API status: {data.get('status')} / message: {data.get('message','')}")
-        if data.get('status') == '000':
-            corp_code = data.get('corp_code', '')
-            print(f"    📌 DART corp_code: {corp_code} ({data.get('corp_name', '')})")
-            return corp_code
-    except Exception as e:
-        print(f"    ⚠ DART corp_code 조회 실패: {e}")
-    return None
-
-
 def dart_search_cb_disclosure(corp_code, issu_dt_str):
     """CB/BW/EB 발행결정 공시 검색 → rcept_no 반환"""
     try:
@@ -197,26 +229,25 @@ def dart_search_cb_disclosure(corp_code, issu_dt_str):
         }
         r = requests.get(url, params=params, timeout=10)
         data = r.json()
-        print(f"    🌐 DART list API status: {data.get('status')} / message: {data.get('message','')}")
+        print(f"    🌐 DART list status: {data.get('status')} (기간: {bgn_de}~{end_de})")
 
         if data.get('status') not in ('000', '013'):
-            print(f"    ⚠ DART 공시목록 조회 실패: {data.get('message', '')}")
+            print(f"    ⚠ 공시목록 조회 실패: {data.get('message', '')}")
             return None
 
         keywords = ['전환사채', '신주인수권', '교환사채']
         items = data.get('list', [])
-        print(f"    📋 공시 목록 {len(items)}건 검색됨 (기간: {bgn_de}~{end_de})")
+        print(f"    📋 공시 {len(items)}건")
         for item in items:
             rpt = item.get('report_nm', '')
-            print(f"       - {rpt}")
             if any(kw in rpt for kw in keywords):
                 rcept_no = item.get('rcept_no')
-                print(f"    📄 DART 공시 발견: {rpt} ({rcept_no})")
+                print(f"    📄 발견: {rpt} ({rcept_no})")
                 return rcept_no
 
-        print(f"    ℹ DART 해당 공시 없음")
+        print(f"    ℹ 해당 공시 없음")
     except Exception as e:
-        print(f"    ⚠ DART 공시검색 실패: {e}")
+        print(f"    ⚠ 공시검색 실패: {e}")
     return None
 
 
@@ -225,10 +256,9 @@ def dart_parse_ytm(rcept_no):
     try:
         url = f"{DART_BASE}/document.xml"
         r = requests.get(url, params={'crtfc_key': DART_KEY, 'rcept_no': rcept_no}, timeout=30)
-        print(f"    🌐 DART document API 응답코드: {r.status_code} / 크기: {len(r.content)} bytes")
+        print(f"    🌐 document API: {r.status_code} / {len(r.content):,} bytes")
 
         z = zipfile.ZipFile(io.BytesIO(r.content))
-        print(f"    📦 ZIP 내 파일 목록: {z.namelist()}")
 
         for fname in z.namelist():
             if not (fname.endswith('.xml') or fname.endswith('.html') or fname.endswith('.htm')):
@@ -248,10 +278,9 @@ def dart_parse_ytm(rcept_no):
             clean = re.sub(r'<[^>]+>', ' ', text)
             clean = re.sub(r'\s+', ' ', clean)
 
-            # 만기이자율 주변 텍스트 출력 (디버깅용)
             idx = clean.find('만기이자율')
             if idx >= 0:
-                print(f"    🔎 '만기이자율' 발견 in {fname}: ...{clean[max(0,idx-20):idx+60]}...")
+                print(f"    🔎 '만기이자율' 발견: ...{clean[max(0,idx-10):idx+50]}...")
 
             patterns = [
                 r'만기이자율\s*[\(%\s]*([0-9]+(?:\.[0-9]+)?)',
@@ -262,59 +291,51 @@ def dart_parse_ytm(rcept_no):
                 m = re.search(pat, clean)
                 if m:
                     val = m.group(1)
-                    print(f"    ✅ 만기이자율 파싱 성공: {val}%")
+                    print(f"    ✅ 만기이자율: {val}%")
                     return val
 
-        print(f"    ℹ 만기이자율 텍스트 미발견")
+        print(f"    ℹ 만기이자율 미발견")
     except Exception as e:
-        print(f"    ⚠ DART 문서 파싱 실패: {e}")
+        print(f"    ⚠ 문서 파싱 실패: {e}")
     return ''
 
 
 def parse_dart_ytm_for_bond(isin, issu_dt_str, xrc_stk_isin):
-    """CB/BW/EB 1개 종목의 YTM을 DART에서 가져오는 메인 함수"""
     if not API_DART_YTM:
         return ''
-
-    print(f"    🔑 DART_KEY 앞6자리: {DART_KEY[:6] if DART_KEY else '없음(빈값)'}")
-    print(f"    📎 xrc_stk_isin: {xrc_stk_isin}")
 
     stock_code_6 = ''
     if xrc_stk_isin and len(xrc_stk_isin) >= 9:
         stock_code_6 = xrc_stk_isin[3:9]
 
-    print(f"    📎 stock_code_6: {stock_code_6}")
+    print(f"    📎 xrc_stk_isin={xrc_stk_isin} → stock_code_6={stock_code_6}")
 
     if not stock_code_6:
-        print(f"    ⚠ 주식 단축코드 추출 실패 → DART 조회 중단")
+        print(f"    ⚠ stock_code 추출 실패")
         return ''
 
     corp_code = dart_get_corp_code(stock_code_6)
     if not corp_code:
-        print(f"    ⚠ corp_code 없음 → DART 조회 중단")
         return ''
 
     rcept_no = dart_search_cb_disclosure(corp_code, issu_dt_str)
     if not rcept_no:
         return ''
 
-    ytm = dart_parse_ytm(rcept_no)
-    return ytm
+    return dart_parse_ytm(rcept_no)
 
 
 # ============================================================
-# [디버깅용] raw XML 출력 함수
+# [디버깅용]
 # ============================================================
 def debug_raw_xml(isin):
     print(f"\n{'='*60}")
     print(f"🔬 디버깅 ISIN: {isin}")
-
     apis = [
         ('getXrcStkStatInfo',      {'BOND_ISIN': isin}),
         ('getBondOptionXrcInfo',   {'ISIN': isin}),
         ('getXrcStkOptionXrcInfo', {'BOND_ISIN': isin}),
     ]
-
     for api_id, params in apis:
         print(f"\n--- {api_id} ---")
         params_str = ','.join([f"{k}:{v}" for k, v in params.items()])
@@ -325,7 +346,6 @@ def debug_raw_xml(isin):
             print(decoded[:3000])
         except Exception as e:
             print(f"  ⚠ 호출 실패: {e}")
-
     print(f"{'='*60}\n")
 
 
@@ -336,7 +356,6 @@ def parse_bond_basic(isin):
     root = seibro_api('getBondStatInfo', {'ISIN': isin})
     if root is None:
         return None
-
     result_el = root.find('.//result')
     if result_el is None:
         return None
@@ -362,16 +381,10 @@ def parse_bond_basic(isin):
 
 def parse_put_call(isin):
     root = seibro_api('getBondOptionXrcInfo', {'ISIN': isin})
-
     result = {
-        'put_begin':  '',
-        'put_end':    '',
-        'put_date':   '',
-        'call_ratio': '',
-        'call_begin': '',
-        'call_end':   '',
+        'put_begin': '', 'put_end': '', 'put_date': '',
+        'call_ratio': '', 'call_begin': '', 'call_end': '',
     }
-
     if root is None:
         return result
 
@@ -397,10 +410,7 @@ def parse_put_call(isin):
 
 def parse_exercise_info(isin):
     result = {
-        'xrc_price':    '',
-        'xrc_begin':    '',
-        'xrc_end':      '',
-        'xrc_stk_isin': '',
+        'xrc_price': '', 'xrc_begin': '', 'xrc_end': '', 'xrc_stk_isin': '',
     }
 
     root = seibro_api('getXrcStkStatInfo', {'BOND_ISIN': isin})
@@ -412,15 +422,12 @@ def parse_exercise_info(isin):
 
     root2 = seibro_api('getXrcStkOptionXrcInfo', {'BOND_ISIN': isin})
     if root2 is not None:
-        begin_dates = []
-        end_dates   = []
+        begin_dates, end_dates = [], []
         for result_el in root2.findall('.//result'):
             b = get_attr(result_el, 'XRC_POSS_BEGIN_DT')
             e = get_attr(result_el, 'XRC_POSS_EXPRY_DT')
-            if b:
-                begin_dates.append(b)
-            if e:
-                end_dates.append(e)
+            if b: begin_dates.append(b)
+            if e: end_dates.append(e)
         if begin_dates:
             result['xrc_begin'] = format_date(min(begin_dates))
         if end_dates:
@@ -490,10 +497,14 @@ async def main():
         for isin in DEBUG_ISINS:
             debug_raw_xml(isin)
             await asyncio.sleep(1.0)
-        print("✅ 디버그 완료. DEBUG_MODE = False 로 바꾸고 다시 실행하세요.")
+        print("✅ 디버그 완료.")
         return
 
-    print(f"🔑 DART_KEY 로드 확인: {DART_KEY[:6] if DART_KEY else '없음'}...")
+    print(f"🔑 DART_KEY: {DART_KEY[:6] if DART_KEY else '없음'}...")
+
+    # DART 기업코드 사전 로드 (1회)
+    dart_load_corp_map()
+
     print("📋 스프레드시트 읽는 중...")
     all_values = worksheet.get_all_values()
 
@@ -524,36 +535,21 @@ async def main():
     first_row = results[0][0]
     last_row  = results[-1][0]
 
-    worksheet.update(
-        [[r['corp_name']] for _, r in results],
-        range_name=f"A{first_row}:A{last_row}"
-    )
+    worksheet.update([[r['corp_name']] for _, r in results], range_name=f"A{first_row}:A{last_row}")
     await asyncio.sleep(1.0)
 
-    worksheet.update(
-        [r['basic_row'] for _, r in results],
-        range_name=f"C{first_row}:F{last_row}"
-    )
+    worksheet.update([r['basic_row'] for _, r in results], range_name=f"C{first_row}:F{last_row}")
     await asyncio.sleep(1.0)
 
-    worksheet.update(
-        [[r['coupon']] for _, r in results],
-        range_name=f"G{first_row}:G{last_row}"
-    )
+    worksheet.update([[r['coupon']] for _, r in results], range_name=f"G{first_row}:G{last_row}")
     await asyncio.sleep(1.0)
 
     if API_DART_YTM:
-        worksheet.update(
-            [[r['ytm']] for _, r in results],
-            range_name=f"H{first_row}:H{last_row}"
-        )
+        worksheet.update([[r['ytm']] for _, r in results], range_name=f"H{first_row}:H{last_row}")
         await asyncio.sleep(1.0)
 
     if API_STOCK_APPROVED:
-        worksheet.update(
-            [[r['exercise']['xrc_price']] for _, r in results],
-            range_name=f"I{first_row}:I{last_row}"
-        )
+        worksheet.update([[r['exercise']['xrc_price']] for _, r in results], range_name=f"I{first_row}:I{last_row}")
         await asyncio.sleep(1.0)
 
     if API_STOCK_APPROVED:
