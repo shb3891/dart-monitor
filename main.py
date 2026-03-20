@@ -16,16 +16,24 @@ SHEET_ID   = os.environ.get('SHEET_ID',   '1s73BDNtCPe5mOs9EjBE5npEfcaNtYRyWJxRB
 # ============================================================
 # [API 승인 플래그]
 # ============================================================
-API_BOND_APPROVED       = True   # ✅ 채권정보
-API_STOCK_APPROVED      = True   # ✅ 주식정보 (방금 승인)
-API_DERIV_APPROVED      = True   # ✅ 파생결합증권정보 (방금 승인)
-API_CORP_APPROVED       = True   # ✅ 기업정보 (방금 승인)
-API_FOREIGN_APPROVED    = True   # ✅ 외화증권정보 (방금 승인)
+API_BOND_APPROVED    = True   # ✅ 채권정보
+API_STOCK_APPROVED   = True   # ✅ 주식정보
+API_DERIV_APPROVED   = True   # ✅ 파생결합증권정보
+API_CORP_APPROVED    = True   # ✅ 기업정보
+API_FOREIGN_APPROVED = True   # ✅ 외화증권정보
 
 # ============================================================
-# [테스트 모드]
+# [테스트 / 디버그 모드]
 # ============================================================
-TEST_MODE = False
+TEST_MODE  = False  # True면 상위 3개만 실행
+DEBUG_MODE = True   # True면 특정 종목 raw XML 출력 후 종료
+
+# 디버깅할 ISIN 목록 (PUT/CALL 있는 종목 위주로 선택)
+DEBUG_ISINS = [
+    "KR6214271E32",  # FSN 13회 CB (PUT 확인됨)
+    "KR6222421DC0",  # 쎄노텍 3회 CB (PUT 확인됨)
+    "KR6049122EC3",  # 파인디앤씨 11회 CB (Coupon=1 확인됨)
+]
 
 # ============================================================
 # [Google Sheets 연결]
@@ -47,6 +55,7 @@ BASE_URL = "https://seibro.or.kr/OpenPlatform/callOpenAPI.jsp"
 # [공통 유틸]
 # ============================================================
 def seibro_api(api_id, params_dict):
+    """SEIBRO OpenAPI 호출 공통 함수"""
     params_str = ','.join([f"{k}:{v}" for k, v in params_dict.items()])
     full_url   = f"{BASE_URL}?key={SEIBRO_KEY}&apiId={api_id}&params={params_str}"
     try:
@@ -88,6 +97,7 @@ def seibro_api(api_id, params_dict):
 
 
 def get_attr(element, tag):
+    """XML 엘리먼트에서 value 속성 추출"""
     el = element.find(f'.//{tag}')
     if el is not None:
         return el.get('value', '')
@@ -95,6 +105,7 @@ def get_attr(element, tag):
 
 
 def format_date(raw):
+    """YYYYMMDD → YYYY-MM-DD 변환"""
     raw = str(raw).strip() if raw else ''
     if len(raw) == 8 and raw.isdigit():
         return f"{raw[:4]}-{raw[4:6]}-{raw[6:]}"
@@ -112,6 +123,7 @@ def fmt_number(val):
 
 
 def extract_hosu(nm):
+    """종목명에서 회차 추출"""
     m = re.search(r'제\s*(\d+)\s*회', nm or '')
     if m:
         return m.group(1)
@@ -125,6 +137,7 @@ def extract_hosu(nm):
 
 
 def extract_corp_name(nm):
+    """종목명에서 회사명 추출"""
     m = re.match(r'([가-힣a-zA-Z\s]+?)\s*\d+\s*(?:CB|EB|BW)', nm or '')
     if m:
         return m.group(1).strip()
@@ -132,6 +145,7 @@ def extract_corp_name(nm):
 
 
 def determine_bond_type(secn_nm):
+    """종목명에서 CB/EB/BW 구분"""
     nm = secn_nm or ''
     if 'EB' in nm or '교환' in nm:
         return 'EB'
@@ -140,6 +154,34 @@ def determine_bond_type(secn_nm):
     if 'BW' in nm or '신주인수권' in nm:
         return 'BW'
     return '-'
+
+
+# ============================================================
+# [디버깅용] raw XML 출력 함수
+# ============================================================
+def debug_raw_xml(isin):
+    """특정 ISIN의 API 응답 raw XML 출력 — 필드명 확인용"""
+    print(f"\n{'='*60}")
+    print(f"🔬 디버깅 ISIN: {isin}")
+
+    apis = [
+        ('getXrcStkStatInfo',      {'BOND_ISIN': isin}),   # 행사가액 / 리픽싱플로어
+        ('getBondOptionXrcInfo',   {'ISIN': isin}),         # PUT / CALL
+        ('getXrcStkOptionXrcInfo', {'BOND_ISIN': isin}),    # 권리청구기간
+    ]
+
+    for api_id, params in apis:
+        print(f"\n--- {api_id} ---")
+        params_str = ','.join([f"{k}:{v}" for k, v in params.items()])
+        full_url   = f"{BASE_URL}?key={SEIBRO_KEY}&apiId={api_id}&params={params_str}"
+        try:
+            r = requests.get(full_url, timeout=10)
+            decoded = r.content.decode('utf-8', errors='replace')
+            print(decoded[:3000])  # 최대 3000자 출력
+        except Exception as e:
+            print(f"  ⚠ 호출 실패: {e}")
+
+    print(f"{'='*60}\n")
 
 
 # ============================================================
@@ -198,12 +240,12 @@ def parse_put_call(isin):
         erly_red_dt = format_date(get_attr(result_el, 'ERLY_RED_DT'))
         xrc_ratio   = get_attr(result_el, 'XRC_RATIO')
 
-        if option_tpcd in ('9402', '9403'):
+        if option_tpcd in ('9402', '9403'):  # PUT 또는 CALL+PUT
             result['put_begin'] = result['put_begin'] or xrc_begin
             result['put_end']   = result['put_end']   or xrc_end
             result['put_date']  = result['put_date']  or erly_red_dt
 
-        if option_tpcd in ('9401', '9403'):
+        if option_tpcd in ('9401', '9403'):  # CALL 또는 CALL+PUT
             result['call_begin'] = result['call_begin'] or xrc_begin
             result['call_end']   = result['call_end']   or xrc_end
             result['call_ratio'] = result['call_ratio'] or xrc_ratio
@@ -213,17 +255,17 @@ def parse_put_call(isin):
 
 def parse_exercise_info(isin):
     """
-    getXrcStkStatInfo      → I(행사가액), J(리픽싱플로어)  ✅ 주식API 승인됨
+    getXrcStkStatInfo      → I(행사가액), J(리픽싱플로어)
     getXrcStkOptionXrcInfo → K(권리청구시작일), L(권리청구종료일)
     """
     result = {
-        'xrc_price':   '',
-        'rfxg_floor':  '',   # ← J열 리픽싱플로어 추가
-        'xrc_begin':   '',
-        'xrc_end':     '',
+        'xrc_price':  '',
+        'rfxg_floor': '',
+        'xrc_begin':  '',
+        'xrc_end':    '',
     }
 
-    # --- 행사가액 + 리픽싱플로어: getXrcStkStatInfo ---
+    # --- 행사가액 + 리픽싱플로어 ---
     root = seibro_api('getXrcStkStatInfo', {'BOND_ISIN': isin})
     if root is not None:
         result_el = root.find('.//result')
@@ -231,7 +273,7 @@ def parse_exercise_info(isin):
             result['xrc_price']  = fmt_number(get_attr(result_el, 'XRC_PRICE'))
             result['rfxg_floor'] = fmt_number(get_attr(result_el, 'RFXG_FLOOR_PRICE'))
 
-    # --- 권리청구기간: getXrcStkOptionXrcInfo ---
+    # --- 권리청구기간 ---
     root2 = seibro_api('getXrcStkOptionXrcInfo', {'BOND_ISIN': isin})
     if root2 is not None:
         begin_dates = []
@@ -300,6 +342,17 @@ def get_mezzanine_data(isin, existing_row):
 # [메인 실행]
 # ============================================================
 async def main():
+
+    # ── 디버그 모드: raw XML 확인 후 종료 ──────────────────
+    if DEBUG_MODE:
+        print("🔬 디버그 모드 실행 중 (시트 업데이트 안 함)\n")
+        for isin in DEBUG_ISINS:
+            debug_raw_xml(isin)
+            await asyncio.sleep(1.0)
+        print("✅ 디버그 완료. DEBUG_MODE = False 로 바꾸고 다시 실행하세요.")
+        return
+    # ───────────────────────────────────────────────────────
+
     print("📋 스프레드시트 읽는 중...")
     all_values = worksheet.get_all_values()
 
@@ -319,6 +372,7 @@ async def main():
         print("⚠ 데이터 없음. 종료.")
         return
 
+    # 결과 수집
     results = []
     for sheet_row, row in data_rows:
         isin   = row[1].strip()
@@ -327,55 +381,70 @@ async def main():
         await asyncio.sleep(1.0)
 
     # --------------------------------------------------------
-    # 시트 업데이트
+    # 시트 업데이트 (DeprecationWarning 수정: values 먼저, range_name 나중)
     # --------------------------------------------------------
     print("\n📝 시트 업데이트 중...")
     first_row = results[0][0]
     last_row  = results[-1][0]
 
     # A열: 종목명
-    worksheet.update(f"A{first_row}:A{last_row}", [[r['corp_name']] for _, r in results])
+    worksheet.update(
+        [[r['corp_name']] for _, r in results],
+        range_name=f"A{first_row}:A{last_row}"
+    )
     await asyncio.sleep(1.0)
 
     # C~F열: 회차, 종류, 발행일, 만기일
-    worksheet.update(f"C{first_row}:F{last_row}", [r['basic_row'] for _, r in results])
+    worksheet.update(
+        [r['basic_row'] for _, r in results],
+        range_name=f"C{first_row}:F{last_row}"
+    )
     await asyncio.sleep(1.0)
 
     # G열: Coupon
-    worksheet.update(f"G{first_row}:G{last_row}", [[r['coupon']] for _, r in results])
+    worksheet.update(
+        [[r['coupon']] for _, r in results],
+        range_name=f"G{first_row}:G{last_row}"
+    )
     await asyncio.sleep(1.0)
 
     # I열: 행사가액
     if API_STOCK_APPROVED:
-        worksheet.update(f"I{first_row}:I{last_row}", [[r['exercise']['xrc_price']] for _, r in results])
+        worksheet.update(
+            [[r['exercise']['xrc_price']] for _, r in results],
+            range_name=f"I{first_row}:I{last_row}"
+        )
         await asyncio.sleep(1.0)
 
-    # J열: 리픽싱플로어  ← 신규 추가
+    # J열: 리픽싱플로어
     if API_STOCK_APPROVED:
-        worksheet.update(f"J{first_row}:J{last_row}", [[r['exercise']['rfxg_floor']] for _, r in results])
+        worksheet.update(
+            [[r['exercise']['rfxg_floor']] for _, r in results],
+            range_name=f"J{first_row}:J{last_row}"
+        )
         await asyncio.sleep(1.0)
 
     # K~L열: 권리청구 시작일, 종료일
     if API_STOCK_APPROVED:
         worksheet.update(
-            f"K{first_row}:L{last_row}",
-            [[r['exercise']['xrc_begin'], r['exercise']['xrc_end']] for _, r in results]
+            [[r['exercise']['xrc_begin'], r['exercise']['xrc_end']] for _, r in results],
+            range_name=f"K{first_row}:L{last_row}"
         )
         await asyncio.sleep(1.0)
 
     # M~O열: PUT 시작일, 종료일, 상환지급일
     if API_BOND_APPROVED:
         worksheet.update(
-            f"M{first_row}:O{last_row}",
-            [[r['put_call']['put_begin'], r['put_call']['put_end'], r['put_call']['put_date']] for _, r in results]
+            [[r['put_call']['put_begin'], r['put_call']['put_end'], r['put_call']['put_date']] for _, r in results],
+            range_name=f"M{first_row}:O{last_row}"
         )
         await asyncio.sleep(1.0)
 
     # Q~S열: CALL 비율, 시작일, 종료일
     if API_BOND_APPROVED:
         worksheet.update(
-            f"Q{first_row}:S{last_row}",
-            [[r['put_call']['call_ratio'], r['put_call']['call_begin'], r['put_call']['call_end']] for _, r in results]
+            [[r['put_call']['call_ratio'], r['put_call']['call_begin'], r['put_call']['call_end']] for _, r in results],
+            range_name=f"Q{first_row}:S{last_row}"
         )
         await asyncio.sleep(1.0)
 
@@ -389,7 +458,7 @@ async def main():
     print(f"  ✅ C~F열  회차·종류·발행일·만기일")
     print(f"  ✅ G열    Coupon")
     print(f"  ✅ I열    행사가액")
-    print(f"  ✅ J열    리픽싱플로어  ← 신규")
+    print(f"  ✅ J열    리픽싱플로어")
     print(f"  ✅ K~L열  권리청구기간")
     print(f"  ✅ M~O열  PUT 정보")
     print(f"  ✅ Q~S열  CALL 정보")
