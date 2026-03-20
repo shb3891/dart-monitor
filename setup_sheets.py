@@ -19,7 +19,6 @@ def col_num_to_letter(n):
     return result
 
 def ref(sheet_name, col, row):
-    """올바른 시트 참조 수식 생성"""
     return f"='{sheet_name}'!{col}{row}"
 
 def fix_master_sheet():
@@ -131,7 +130,8 @@ def create_horizontal_sheet(master_ws):
     ws.update('A1', [headers_row1])
     ws.update('A2', [headers_row2])
     if formula_rows:
-        ws.update('A3', formula_rows)
+        # ✅ USER_ENTERED 옵션 추가
+        ws.update('A3', formula_rows, value_input_option='USER_ENTERED')
 
     total_rows = data_count + 2
     total_cols = len(headers_row2)
@@ -243,13 +243,13 @@ def create_vertical_sheet(master_ws):
         master_row = col_idx + 2
         for row_idx in range(len(row_labels)):
             if row_idx == 9:
-                # 발행일 / 만기일 합치기
                 all_col_data[row_idx][col_idx] = f"='{mn}'!E{master_row}&\" / \"&'{mn}'!F{master_row}"
             elif row_idx in ref_map:
                 all_col_data[row_idx][col_idx] = ref(mn, ref_map[row_idx], master_row)
 
     end_col = col_num_to_letter(len(data_rows) + 1)
-    ws.update(f'B1:{end_col}{len(row_labels)}', all_col_data)
+    # ✅ USER_ENTERED 옵션 추가
+    ws.update(f'B1:{end_col}{len(row_labels)}', all_col_data, value_input_option='USER_ENTERED')
 
     total_cols = len(data_rows) + 1
     requests = []
