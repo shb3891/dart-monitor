@@ -28,16 +28,19 @@ TODAY = datetime.now().strftime('%Y-%m-%d')
 # ============================================================
 # [API 승인 플래그]
 # ============================================================
-API_BOND_APPROVED = True
+API_BOND_APPROVED  = True
 API_STOCK_APPROVED = True
-API_DART = True
+API_DART           = True
 
 # ============================================================
 # [테스트 / 디버그 모드]
+# TEST_MODE  = True  → TEST_COUNT개만 실행
+# TEST_MODE  = False → 전체 종목 실행  ← 현재 설정
+# DEBUG_MODE = True  → API 원본 XML 출력 (DEBUG_ISINS 종목만)
 # ============================================================
-TEST_MODE  = True   # 5개 테스트
-DEBUG_MODE = False
-
+TEST_MODE   = False   # ← 전체 실행
+TEST_COUNT  = 5       # TEST_MODE=True일 때만 사용
+DEBUG_MODE  = False
 DEBUG_ISINS = ["KR6177831E26", "KR6214271E32", "KR6222421DC0"]
 
 # ============================================================
@@ -142,7 +145,6 @@ def fmt_number(val):
 
 
 def parse_korean_date(text):
-    """한국어/숫자 날짜 → YYYY-MM-DD"""
     text = str(text).strip()
     m = re.search(r'(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일', text)
     if m:
@@ -157,10 +159,6 @@ def parse_korean_date(text):
 
 
 def find_next_upcoming_row(rows):
-    """
-    rows: list of (from_dt, to_dt, pay_dt) YYYY-MM-DD
-    오늘 이후 가장 가까운 차 반환. 모두 지났으면 마지막 반환.
-    """
     for from_dt, to_dt, pay_dt in rows:
         if from_dt >= TODAY or (from_dt <= TODAY <= to_dt):
             return from_dt, to_dt, pay_dt
@@ -243,24 +241,13 @@ def dart_search_cb_disclosure(corp_code, issu_dt_str):
 
 
 def dart_parse_disclosure(rcept_no, xrc_price=''):
-    """
-    공시 원문에서 YTM / 리픽싱플로어 / 전환청구기간 / PUT / CALL / YTC 파싱
-    xrc_price: 리픽싱 없음(-) 판정 시 fallback 행사가액
-    """
     result = {
-        'ytm':            '',
-        'rfxg_floor':     '',
-        'xrc_begin_dart': '',
-        'xrc_end_dart':   '',
-        'put_begin':      '',
-        'put_end':        '',
-        'put_date':       '',
-        'call_ratio':     '',
-        'call_begin':     '',
-        'call_end':       '',
-        'ytc':            '',
+        'ytm': '', 'rfxg_floor': '',
+        'xrc_begin_dart': '', 'xrc_end_dart': '',
+        'put_begin': '', 'put_end': '', 'put_date': '',
+        'call_ratio': '', 'call_begin': '', 'call_end': '',
+        'ytc': '',
     }
-
     try:
         r = requests.get(
             f"{DART_BASE}/document.xml",
@@ -268,9 +255,7 @@ def dart_parse_disclosure(rcept_no, xrc_price=''):
             timeout=30
         )
         print(f"    🌐 document API: {r.status_code} / {len(r.content):,} bytes")
-
         z = zipfile.ZipFile(io.BytesIO(r.content))
-
         for fname in z.namelist():
             if not any(fname.endswith(ext) for ext in ['.xml', '.html', '.htm']):
                 continue
@@ -284,13 +269,11 @@ def dart_parse_disclosure(rcept_no, xrc_price=''):
                     continue
             if not text:
                 continue
-
-            # HTML 태그 제거 + 공백 정리
             clean = re.sub(r'<[^>]+>', ' ', text)
             clean = re.sub(r'&nbsp;', ' ', clean)
             clean = re.sub(r'\s+', ' ', clean)
 
-            # ── 1) YTM ──────────────────────────────────────────────
+            # 1) YTM
             for pat in [
                 r'만기이자율[^0-9\n]*([0-9]+(?:\.[0-9]+)?)',
                 r'만기\s*이자율[^0-9\n]*([0-9]+(?:\.[0-9]+)?)',
@@ -299,18 +282,16 @@ def dart_parse_disclosure(rcept_no, xrc_price=''):
                 if m:
                     try:
                         val = float(m.group(1))
-                        if val < 100:   # 연이율은 100% 미만 (연도 2025 등 오탐 방지)
+                        if val < 100:
                             result['ytm'] = m.group(1)
                             print(f"    ✅ YTM: {val}%")
                             break
                     except Exception:
                         pass
 
-            # ── 2) 리픽싱플로어 ──────────────────────────────────────
-            # '최저 조정가액 (원) -' → 리픽싱 없음 → 행사가액과 동일
+            # 2) 리픽싱플로어
             rfxg_m = re.search(
-                r'최저\s*(?:조정|전환|행사)\s*가액[^0-9\n]*?(-|–|[0-9][0-9,]+)',
-                clean
+                r'최저\s*(?:조정|전환|행사)\s*가액[^0-9\n]*?(-|–|[0-9][0-9,]+)', clean
             )
             if rfxg_m:
                 val = rfxg_m.group(1).strip()
@@ -327,12 +308,11 @@ def dart_parse_disclosure(rcept_no, xrc_price=''):
                     except Exception:
                         pass
             else:
-                # 섹션 자체 없으면 행사가액과 동일 처리
                 if xrc_price:
                     result['rfxg_floor'] = xrc_price
                     print(f"    ✅ 리픽싱플로어: 미기재→ 행사가액={xrc_price}")
 
-            # ── 3) 전환청구기간 (K/L열) ──────────────────────────────
+            # 3) 전환청구기간
             for kw in ['전환청구기간', '교환청구기간', '행사청구기간', '권리행사기간', '전환권 행사']:
                 idx = clean.find(kw)
                 if idx < 0:
@@ -353,21 +333,17 @@ def dart_parse_disclosure(rcept_no, xrc_price=''):
                 if result['xrc_begin_dart'] or result['xrc_end_dart']:
                     break
 
-            # ── 4) PUT - 조기상환청구기간 ────────────────────────────
+            # 4) PUT
             put_idx = -1
             for kw in ['조기상환 청구기간', '조기상환청구기간', '[조기상환청구권', '조기상환청구권(Put']:
                 idx = clean.find(kw)
                 if idx >= 0:
                     put_idx = idx
                     break
-
             if put_idx >= 0:
                 put_section = clean[put_idx: put_idx + 5000]
                 dates = re.findall(r'\d{4}-\d{2}-\d{2}', put_section)
-                rows = [
-                    (dates[i*3], dates[i*3+1], dates[i*3+2])
-                    for i in range(len(dates) // 3)
-                ]
+                rows = [(dates[i*3], dates[i*3+1], dates[i*3+2]) for i in range(len(dates) // 3)]
                 if rows:
                     f, t, p = find_next_upcoming_row(rows)
                     result['put_begin'] = f
@@ -380,28 +356,22 @@ def dart_parse_disclosure(rcept_no, xrc_price=''):
                 result['put_date']  = '-'
                 print("    ℹ PUT 없음(-)")
 
-            # ── 5) CALL - 매도청구권 ─────────────────────────────────
+            # 5) CALL
             call_idx = -1
             for kw in [
                 '매도청구권(Call Option)', '매도청구권(call option)',
-                '[매도청구권', '매도청구권에 관한', '매도 청구권',
-                '콜옵션', '콜 옵션',
+                '[매도청구권', '매도청구권에 관한', '매도 청구권', '콜옵션', '콜 옵션',
             ]:
                 m_idx = re.search(re.escape(kw), clean, re.IGNORECASE)
                 if m_idx:
                     call_idx = m_idx.start()
                     break
-
             if call_idx >= 0:
                 call_section = clean[call_idx: call_idx + 5000]
-
-                # YTC: 연 단리 X%
                 ytc_m = re.search(r'연\s*단리\s*([0-9]+(?:\.[0-9]+)?)\s*%', call_section)
                 if ytc_m:
                     result['ytc'] = ytc_m.group(1)
                     print(f"    ✅ YTC: {result['ytc']}%")
-
-                # CALL 비율
                 for ratio_pat in [
                     r'([0-9]+(?:\.[0-9]+)?)%를?\s*총\s*한도',
                     r'\(Call\s*Option\s*([0-9]+(?:\.[0-9]+)?)\s*%\)',
@@ -419,20 +389,14 @@ def dart_parse_disclosure(rcept_no, xrc_price=''):
                                 break
                         except Exception:
                             pass
-
-                # CALL 날짜 테이블 (FROM, TO, 매매일) - 3개씩 묶기
                 call_dates = re.findall(r'\d{4}-\d{2}-\d{2}', call_section)
-                call_rows = [
-                    (call_dates[i*3], call_dates[i*3+1], call_dates[i*3+2])
-                    for i in range(len(call_dates) // 3)
-                ]
+                call_rows = [(call_dates[i*3], call_dates[i*3+1], call_dates[i*3+2]) for i in range(len(call_dates) // 3)]
                 if call_rows:
                     f, t, _ = find_next_upcoming_row(call_rows)
                     result['call_begin'] = f
                     result['call_end']   = t
                     print(f"    ✅ CALL일정: {f}~{t}")
                 else:
-                    # 한국어 날짜 형식 시도
                     b_m = re.search(r'(\d{4}년\s*\d{1,2}월\s*\d{1,2}일)부터', call_section)
                     e_m = re.search(r'(\d{4}년\s*\d{1,2}월\s*\d{1,2}일)까지', call_section)
                     if b_m:
@@ -449,7 +413,6 @@ def dart_parse_disclosure(rcept_no, xrc_price=''):
 
     except Exception as e:
         print(f"    ⚠ DART 문서 파싱 실패: {e}")
-
     return result
 
 
@@ -463,20 +426,16 @@ def parse_dart_for_bond(isin, issu_dt_str, xrc_stk_isin, xrc_price=''):
     }
     if not API_DART:
         return empty
-
     stock_code_6 = xrc_stk_isin[3:9] if xrc_stk_isin and len(xrc_stk_isin) >= 9 else ''
     print(f"    📎 xrc_stk_isin={xrc_stk_isin} → stock_code_6={stock_code_6}")
     if not stock_code_6:
         return empty
-
     corp_code = dart_get_corp_code(stock_code_6)
     if not corp_code:
         return empty
-
     rcept_no = dart_search_cb_disclosure(corp_code, issu_dt_str)
     if not rcept_no:
         return empty
-
     return dart_parse_disclosure(rcept_no, xrc_price=xrc_price)
 
 
@@ -497,12 +456,11 @@ def parse_bond_basic(isin):
         'bond_type': determine_bond_type(secn_nm),
         'issu_dt':   format_date(get_attr(el, 'ISSU_DT')),
         'xpir_dt':   format_date(get_attr(el, 'XPIR_DT')),
-        'coupon':    get_attr(el, 'COUPON_RATE'),   # 0 포함, 빈값만 제외
+        'coupon':    get_attr(el, 'COUPON_RATE'),
     }
 
 
 def parse_put_call_seibro(isin):
-    """SEIBRO PUT/CALL (이력 기반 - DART 없을 때 보완용)"""
     root = seibro_api('getBondOptionXrcInfo', {'ISIN': isin})
     r = {'put_begin': '', 'put_end': '', 'put_date': '',
          'call_ratio': '', 'call_begin': '', 'call_end': ''}
@@ -552,8 +510,8 @@ def parse_exercise_info(isin):
 def debug_raw_xml(isin):
     print(f"\n{'='*60}\n🔬 디버깅 ISIN: {isin}")
     for api_id, params in [
-        ('getXrcStkStatInfo', {'BOND_ISIN': isin}),
-        ('getBondOptionXrcInfo', {'ISIN': isin}),
+        ('getXrcStkStatInfo',      {'BOND_ISIN': isin}),
+        ('getBondOptionXrcInfo',   {'ISIN': isin}),
         ('getXrcStkOptionXrcInfo', {'BOND_ISIN': isin}),
     ]:
         print(f"\n--- {api_id} ---")
@@ -575,7 +533,6 @@ def debug_raw_xml(isin):
 def get_mezzanine_data(isin, existing_row):
     print(f"  🔍 {isin}", end=' ')
 
-    # ── SEIBRO 기본정보 ──
     basic = parse_bond_basic(isin)
     if basic:
         print(f"→ {basic['corp_name']} {basic['hosu']}회 {basic['bond_type']}")
@@ -595,18 +552,15 @@ def get_mezzanine_data(isin, existing_row):
         coupon  = existing_row[6].strip() if len(existing_row) > 6 else ''
         issu_dt = existing_row[4].strip() if len(existing_row) > 4 else ''
 
-    # ── SEIBRO 행사가액 / 권리청구기간 ──
     exercise = parse_exercise_info(isin) if API_STOCK_APPROVED else {
         'xrc_price': '', 'xrc_begin': '', 'xrc_end': '', 'xrc_stk_isin': '',
     }
 
-    # ── SEIBRO PUT/CALL (보완용) ──
     seibro_pc = parse_put_call_seibro(isin) if API_BOND_APPROVED else {
         'put_begin': '', 'put_end': '', 'put_date': '',
         'call_ratio': '', 'call_begin': '', 'call_end': '',
     }
 
-    # ── DART (YTM / 리픽싱 / 전환청구기간 / PUT / CALL / YTC) ──
     dart_data = {
         'ytm': '', 'rfxg_floor': '',
         'xrc_begin_dart': '', 'xrc_end_dart': '',
@@ -623,11 +577,9 @@ def get_mezzanine_data(isin, existing_row):
     else:
         print(f"    ℹ DART 스킵 (xrc_stk_isin={exercise.get('xrc_stk_isin')}, issu_dt={issu_dt})")
 
-    # K/L열: DART 우선, SEIBRO 보완
     final_xrc_begin = dart_data.get('xrc_begin_dart') or exercise['xrc_begin']
     final_xrc_end   = dart_data.get('xrc_end_dart')   or exercise['xrc_end']
 
-    # M/N/O열: DART '-' 이면 그대로, 아니면 DART 우선 + SEIBRO 보완
     if dart_data['put_begin'] == '-':
         final_put = {'put_begin': '-', 'put_end': '-', 'put_date': '-'}
     else:
@@ -637,7 +589,6 @@ def get_mezzanine_data(isin, existing_row):
             'put_date':  dart_data['put_date']  or seibro_pc['put_date'],
         }
 
-    # Q/R/S열: DART '-' 이면 그대로
     if dart_data['call_ratio'] == '-':
         final_call = {'call_ratio': '-', 'call_begin': '-', 'call_end': '-'}
     else:
@@ -687,10 +638,10 @@ async def main():
     ]
 
     if TEST_MODE:
-        data_rows = data_rows[:5]
-        print(f"🧪 테스트 모드: 상위 5개\n")
+        data_rows = data_rows[:TEST_COUNT]
+        print(f"🧪 테스트 모드: 상위 {TEST_COUNT}개\n")
     else:
-        print(f"🚀 전체 {len(data_rows)}개 종목\n")
+        print(f"🚀 전체 {len(data_rows)}개 종목 실행\n")
 
     if not data_rows:
         print("⚠ 데이터 없음.")
@@ -702,6 +653,9 @@ async def main():
         results.append((sheet_row, result))
         await asyncio.sleep(1.5)
 
+    # --------------------------------------------------------
+    # 시트 업데이트 (연속 행 배치 업데이트)
+    # --------------------------------------------------------
     print("\n📝 시트 업데이트 중...")
     fr = results[0][0]
     lr = results[-1][0]
@@ -709,25 +663,25 @@ async def main():
     def upd(rng, vals):
         worksheet.update(vals, range_name=rng)
 
-    upd(f"A{fr}:A{lr}", [[r['corp_name']] for _, r in results])
+    upd(f"A{fr}:A{lr}",  [[r['corp_name']]  for _, r in results])
     await asyncio.sleep(1.0)
-    upd(f"C{fr}:F{lr}", [r['basic_row'] for _, r in results])
+    upd(f"C{fr}:F{lr}",  [r['basic_row']    for _, r in results])
     await asyncio.sleep(1.0)
-    upd(f"G{fr}:G{lr}", [[r['coupon']] for _, r in results])
+    upd(f"G{fr}:G{lr}",  [[r['coupon']]     for _, r in results])
     await asyncio.sleep(1.0)
-    upd(f"H{fr}:H{lr}", [[r['ytm']] for _, r in results])
+    upd(f"H{fr}:H{lr}",  [[r['ytm']]        for _, r in results])
     await asyncio.sleep(1.0)
-    upd(f"I{fr}:I{lr}", [[r['xrc_price']] for _, r in results])
+    upd(f"I{fr}:I{lr}",  [[r['xrc_price']]  for _, r in results])
     await asyncio.sleep(1.0)
-    upd(f"J{fr}:J{lr}", [[r['rfxg_floor']] for _, r in results])
+    upd(f"J{fr}:J{lr}",  [[r['rfxg_floor']] for _, r in results])
     await asyncio.sleep(1.0)
-    upd(f"K{fr}:L{lr}", [[r['xrc_begin'], r['xrc_end']] for _, r in results])
+    upd(f"K{fr}:L{lr}",  [[r['xrc_begin'],  r['xrc_end']]  for _, r in results])
     await asyncio.sleep(1.0)
-    upd(f"M{fr}:O{lr}", [[r['put']['put_begin'], r['put']['put_end'], r['put']['put_date']] for _, r in results])
+    upd(f"M{fr}:O{lr}",  [[r['put']['put_begin'], r['put']['put_end'], r['put']['put_date']] for _, r in results])
     await asyncio.sleep(1.0)
-    upd(f"Q{fr}:S{lr}", [[r['call']['call_ratio'], r['call']['call_begin'], r['call']['call_end']] for _, r in results])
+    upd(f"Q{fr}:S{lr}",  [[r['call']['call_ratio'], r['call']['call_begin'], r['call']['call_end']] for _, r in results])
     await asyncio.sleep(1.0)
-    upd(f"T{fr}:T{lr}", [[r['ytc']] for _, r in results])
+    upd(f"T{fr}:T{lr}",  [[r['ytc']]        for _, r in results])
     await asyncio.sleep(1.0)
 
     ytm_c  = sum(1 for _, r in results if r['ytm'])
@@ -741,14 +695,14 @@ async def main():
     print(f"\n📌 업데이트 현황:")
     print(f"  ✅ A열    종목명")
     print(f"  ✅ C~F열  회차·종류·발행일·만기일")
-    print(f"  ✅ G열    Coupon (0 포함)")
-    print(f"  ✅ H열    YTM ← DART ({ytm_c}/{len(results)}개)")
+    print(f"  ✅ G열    Coupon")
+    print(f"  ✅ H열    YTM       ← DART ({ytm_c}/{len(results)}개)")
     print(f"  ✅ I열    행사가액")
-    print(f"  ✅ J열    리픽싱플로어 ← DART ({rfxg_c}/{len(results)}개, 없으면 행사가액)")
+    print(f"  ✅ J열    리픽싱플로어 ← DART ({rfxg_c}/{len(results)}개)")
     print(f"  ✅ K~L열  전환청구기간 ← DART 우선 + SEIBRO 보완")
-    print(f"  ✅ M~O열  PUT ← DART 다음차수 ({put_c}/{len(results)}개, 없으면 -)")
-    print(f"  ✅ Q~S열  CALL ← DART 다음차수 ({call_c}/{len(results)}개, 없으면 -)")
-    print(f"  ✅ T열    YTC ← DART ({ytc_c}/{len(results)}개)")
+    print(f"  ✅ M~O열  PUT       ← DART ({put_c}/{len(results)}개, 없으면 -)")
+    print(f"  ✅ Q~S열  CALL      ← DART ({call_c}/{len(results)}개, 없으면 -)")
+    print(f"  ✅ T열    YTC       ← DART ({ytc_c}/{len(results)}개)")
     print(f"  ⏳ P열    YTP (추후)")
 
 
