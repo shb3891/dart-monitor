@@ -334,8 +334,8 @@ def check_audit_reports():
         bond_type = h['bond_type']
         print(f"  🔍 {name} ({isin})", end=' ')
 
-        # corp_code 획득 (중복 제거 단계에서 이미 조회한 값 재사용)
-        corp_code = h.get('corp_code_cache', '')
+        # corp_code: 사전 조회에서 캐시된 값 그대로 사용 (재호출 없음)
+        corp_code = h.get('_corp_code', '')
         if corp_code:
             print(f"→ corp_code: {corp_code}")
         else:
