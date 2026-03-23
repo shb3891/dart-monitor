@@ -158,14 +158,13 @@ def parse_korean_date(text):
 def find_next_upcoming_row(rows):
     # ── 날짜 역전된 행 필터링 (from > to 인 경우 제외) ──
     valid_rows = [(f, t, p) for f, t, p in rows if f <= t]
+    # 모두 역전이면 그냥 빈 값 반환 (역전 데이터를 시트에 쓰지 않음)
     if not valid_rows:
-        valid_rows = rows  # 모두 역전이면 원본 사용
+        return '', '', ''
     for from_dt, to_dt, pay_dt in valid_rows:
         if from_dt >= TODAY or (from_dt <= TODAY <= to_dt):
             return from_dt, to_dt, pay_dt
-    if valid_rows:
-        return valid_rows[-1]
-    return '', '', ''
+    return valid_rows[-1]
 
 
 def extract_hosu(nm):
@@ -434,8 +433,20 @@ def dart_parse_disclosure(rcept_no, xrc_price=''):
                     result['call_end']   = t
                     print(f"    ✅ CALL일정: {f}~{t}")
                 else:
+                    # 한국어 날짜 패턴 (부터/까지 또는 ~)
                     b_m = re.search(r'(\d{4}년\s*\d{1,2}월\s*\d{1,2}일)부터', call_section)
                     e_m = re.search(r'(\d{4}년\s*\d{1,2}월\s*\d{1,2}일)까지', call_section)
+                    if not b_m:
+                        # "YYYY년 MM월 DD일 ~ YYYY년 MM월 DD일" 형태
+                        range_m = re.search(
+                            r'(\d{4}년\s*\d{1,2}월\s*\d{1,2}일)\s*~\s*(\d{4}년\s*\d{1,2}월\s*\d{1,2}일)',
+                            call_section
+                        )
+                        if range_m:
+                            b_m = type('m', (), {'group': lambda self, n: range_m.group(n)})()
+                            b_m.group = lambda n: range_m.group(1) if n == 1 else ''
+                            e_m = type('m', (), {'group': lambda self, n: range_m.group(2)})()
+                            e_m.group = lambda n: range_m.group(2) if n == 1 else ''
                     if b_m:
                         result['call_begin'] = parse_korean_date(b_m.group(1))
                     if e_m:
