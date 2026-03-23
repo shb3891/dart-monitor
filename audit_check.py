@@ -97,17 +97,48 @@ def get_xrc_stk_isin(bond_isin):
         pass
     return ''
 
-def get_corp_code(bond_isin):
+def get_corp_code_by_name_api(corp_name):
+    """DART company.json으로 기업명 검색 → corp_code 반환"""
+    try:
+        r = requests.get(
+            f"{DART_BASE}/company.json",
+            params={'crtfc_key': DART_KEY, 'corp_name': corp_name},
+            timeout=10,
+        )
+        data = r.json()
+        if data.get('status') != '000':
+            return ''
+        items = data.get('list', [])
+        # 상장사 우선
+        listed = [x for x in items if x.get('stock_code', '').strip()]
+        for item in (listed or items):
+            code = item.get('corp_code', '')
+            if code:
+                return code
+    except Exception:
+        pass
+    return ''
+
+
+def get_corp_code(bond_isin, corp_name=''):
     """
     채권 ISIN → corp_code 획득
     1) SEIBRO xrc_stk_isin → stock_code_6 → DART_CORP_DICT
-    2) Fallback: DART company.json 기업명 검색
+    2) Fallback: DART company.json 기업명 검색 (호텔신라 등 dict 누락 케이스)
     """
     xrc_stk_isin = get_xrc_stk_isin(bond_isin)
     if xrc_stk_isin and len(xrc_stk_isin) >= 9:
         stock_code_6 = xrc_stk_isin[3:9]
         corp_code = DART_CORP_DICT.get(stock_code_6, '')
         if corp_code:
+            return corp_code
+        print(f"    ⚠ stock_code {stock_code_6} dict 미등록 → 기업명 검색 시도")
+
+    # Fallback: 기업명으로 검색
+    if corp_name:
+        corp_code = get_corp_code_by_name_api(corp_name)
+        if corp_code:
+            print(f"    📌 corp_code(기업명검색): {corp_code} ({corp_name})")
             return corp_code
 
     return ''
@@ -260,13 +291,21 @@ def check_audit_reports():
         if len(row) > 1 and row[1].strip().startswith('KR')
            and row[0].strip() not in ('-', '')
     ]
-    # 동일 종목명 중복 제거 (성호전자 16/17회 등 → 감사보고서는 법인 기준이라 1번만)
-    seen_names = set()
+    # 중복 제거: ISIN 기준 (종목명이 같아도 ISIN이 다르면 별개 법인일 수 있음)
+    # 단, 감사보고서는 법인 단위라 같은 법인의 여러 회차는 1번만 조회
+    # → xrc_stk_isin(주식코드) 기준으로 중복 제거
+    seen_isins = set()
     deduped = []
     for h in holdings:
-        if h['name'] not in seen_names:
-            seen_names.add(h['name'])
+        # SEIBRO에서 주식 ISIN 미리 조회해서 dedup 키로 사용
+        xrc = get_xrc_stk_isin(h['isin'])
+        dedup_key = xrc if xrc else h['isin']  # 주식ISIN 없으면 채권ISIN으로 구분
+        if dedup_key not in seen_isins:
+            seen_isins.add(dedup_key)
+            h['xrc_stk_isin'] = xrc
             deduped.append(h)
+        else:
+            print(f"  ⏭ 중복 법인 스킵: {h['name']} ({h['isin']})")
     holdings = deduped
 
     if TEST_MODE:
@@ -286,8 +325,22 @@ def check_audit_reports():
         bond_type = h['bond_type']
         print(f"  🔍 {name} ({isin})", end=' ')
 
-        # corp_code 획득
-        corp_code = get_corp_code(isin)
+        # corp_code 획득 (이미 xrc_stk_isin 조회됨)
+        corp_code = ''
+        xrc_stk_isin = h.get('xrc_stk_isin', '')
+        if xrc_stk_isin and len(xrc_stk_isin) >= 9:
+            stock_code_6 = xrc_stk_isin[3:9]
+            corp_code = DART_CORP_DICT.get(stock_code_6, '')
+            if not corp_code:
+                print(f"    ⚠ stock_code {stock_code_6} dict 미등록 → 기업명 검색")
+                corp_code = get_corp_code_by_name_api(name)
+                if corp_code:
+                    print(f"    📌 corp_code(기업명): {corp_code}")
+        if not corp_code:
+            corp_code = get_corp_code_by_name_api(name)
+            if corp_code:
+                print(f"    📌 corp_code(기업명): {corp_code}")
+
         if not corp_code:
             print(f"→ ⚠ corp_code 없음")
             results.append({
