@@ -1,28 +1,14 @@
-name: Hourly Dart Monitor
-
-on:
-  schedule:
-    - cron: '0 0-7 * * *'
-  workflow_dispatch:
-
-jobs:
-  run-bot:
+audit-check:
     runs-on: ubuntu-latest
-
+    if: github.event_name == 'workflow_dispatch'
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
         with:
           python-version: '3.11'
-
-      - name: Install dependencies
-        run: pip install gspread google-auth requests
-
-      - name: Run Monitoring Bot
+      - run: pip install gspread google-auth requests
+      - name: Run Audit Checker
         env:
           GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
           DART_API_KEY: ${{ secrets.DART_API_KEY }}
-        run: python main.py
+        run: python audit_check.py
