@@ -291,18 +291,27 @@ def check_audit_reports():
         if len(row) > 1 and row[1].strip().startswith('KR')
            and row[0].strip() not in ('-', '')
     ]
-    # 중복 제거: ISIN 기준 (종목명이 같아도 ISIN이 다르면 별개 법인일 수 있음)
-    # 단, 감사보고서는 법인 단위라 같은 법인의 여러 회차는 1번만 조회
-    # → xrc_stk_isin(주식코드) 기준으로 중복 제거
-    seen_isins = set()
+    # 중복 제거: corp_code 기준
+    # xrc_stk_isin이 같아도 발행사가 다른 경우 있음 (다솔 EB → 교환대상이 에르코스)
+    # → 먼저 corp_code를 구한 뒤, 같은 corp_code면 중복으로 처리
+    print("  🔄 corp_code 사전 조회 중 (중복 제거용)...")
+    seen_corp_codes = set()
     deduped = []
     for h in holdings:
-        # SEIBRO에서 주식 ISIN 미리 조회해서 dedup 키로 사용
         xrc = get_xrc_stk_isin(h['isin'])
-        dedup_key = xrc if xrc else h['isin']  # 주식ISIN 없으면 채권ISIN으로 구분
-        if dedup_key not in seen_isins:
-            seen_isins.add(dedup_key)
-            h['xrc_stk_isin'] = xrc
+        h['xrc_stk_isin'] = xrc
+
+        # corp_code 임시 조회
+        corp_code = ''
+        if xrc and len(xrc) >= 9:
+            corp_code = DART_CORP_DICT.get(xrc[3:9], '')
+        if not corp_code:            corp_code = get_corp_code_by_name_api(h['name'])
+
+        dedup_key = corp_code if corp_code else f"unknown_{h['isin']}"
+
+        if dedup_key not in seen_corp_codes:
+            seen_corp_codes.add(dedup_key)
+            h['corp_code_cache'] = corp_code   # 나중에 재사용
             deduped.append(h)
         else:
             print(f"  ⏭ 중복 법인 스킵: {h['name']} ({h['isin']})")
@@ -325,23 +334,12 @@ def check_audit_reports():
         bond_type = h['bond_type']
         print(f"  🔍 {name} ({isin})", end=' ')
 
-        # corp_code 획득 (이미 xrc_stk_isin 조회됨)
-        corp_code = ''
-        xrc_stk_isin = h.get('xrc_stk_isin', '')
-        if xrc_stk_isin and len(xrc_stk_isin) >= 9:
-            stock_code_6 = xrc_stk_isin[3:9]
-            corp_code = DART_CORP_DICT.get(stock_code_6, '')
-            if not corp_code:
-                print(f"    ⚠ stock_code {stock_code_6} dict 미등록 → 기업명 검색")
-                corp_code = get_corp_code_by_name_api(name)
-                if corp_code:
-                    print(f"    📌 corp_code(기업명): {corp_code}")
-        if not corp_code:
-            corp_code = get_corp_code_by_name_api(name)
-            if corp_code:
-                print(f"    📌 corp_code(기업명): {corp_code}")
-
-        if not corp_code:
+        # corp_code 획득 (중복 제거 단계에서 이미 조회한 값 재사용)
+        corp_code = h.get('corp_code_cache', '')
+        if corp_code:
+            print(f"→ corp_code: {corp_code}")
+        else:
+            print(f"→ ⚠ corp_code 없음")
             print(f"→ ⚠ corp_code 없음")
             results.append({
                 'name': name, 'isin': isin, 'bond_type': bond_type,
@@ -403,6 +401,10 @@ def write_results_to_sheet(ws, results):
 
     write_header(ws)
     time.sleep(2.0)
+
+    # ── 기존 데이터 전체 클리어 후 재기록 (잔여 행 완전 제거) ──
+    ws.batch_clear(['A2:J300'])   # 300행까지 확실히 클리어
+    time.sleep(1.5)
 
     ws.update(rows, range_name=f'A2:J{len(rows)+1}')
     time.sleep(2.0)
