@@ -156,11 +156,15 @@ def parse_korean_date(text):
 
 
 def find_next_upcoming_row(rows):
-    for from_dt, to_dt, pay_dt in rows:
+    # ── 날짜 역전된 행 필터링 (from > to 인 경우 제외) ──
+    valid_rows = [(f, t, p) for f, t, p in rows if f <= t]
+    if not valid_rows:
+        valid_rows = rows  # 모두 역전이면 원본 사용
+    for from_dt, to_dt, pay_dt in valid_rows:
         if from_dt >= TODAY or (from_dt <= TODAY <= to_dt):
             return from_dt, to_dt, pay_dt
-    if rows:
-        return rows[-1]
+    if valid_rows:
+        return valid_rows[-1]
     return '', '', ''
 
 
@@ -230,18 +234,23 @@ def dart_search_cb_disclosure(corp_code, issu_dt_str):
         issue_kws = [
             '전환사채권발행결정', '교환사채권발행결정', '신주인수권부사채권발행결정',
         ]
-        # 정정 공시 키워드 (기재정정으로 원본 공시번호가 갱신된 케이스)
+        # 정정 공시 키워드
         correction_kws = [
             '[기재정정]전환사채권발행결정', '[기재정정]교환사채권발행결정',
             '[기재정정]신주인수권부사채권발행결정',
         ]
+        # ── 추가: 대기업 EB 등 pblntf_ty='A'(정기공시) 포함 재검색용 ──
         items = data.get('list', [])
         print(f"    📋 공시 {len(items)}건")
 
-        # 우선순위: 정정 공시 → 원본 발행결정 순
+        # 우선순위: 기재정정 → 원본 발행결정 (첨부정정은 제외)
         for priority_kws in [correction_kws, issue_kws]:
             for item in items:
                 rpt = item.get('report_nm', '')
+                # [첨부정정]은 본문이 없는 껍데기 공시 → 스킵
+                if '[첨부정정]' in rpt:
+                    print(f"    ⏭ 첨부정정 스킵: {rpt}")
+                    continue
                 if any(kw in rpt for kw in priority_kws):
                     rcept_no = item.get('rcept_no')
                     print(f"    📄 발견: {rpt} ({rcept_no})")
