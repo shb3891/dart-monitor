@@ -13,20 +13,19 @@ from google.oauth2.service_account import Credentials
 # ============================================================
 # [설정]
 # ============================================================
-SEIBRO_KEY = os.environ.get('SEIBRO_KEY', 'e1e03a31bc0583fc0c853d4c41a0dc018dc4d2aa21c363c3d6b1b0b96e85221b')
-DART_KEY = (
+SEIBRO_KEY  = os.environ.get('SEIBRO_KEY', 'e1e03a31bc0583fc0c853d4c41a0dc018dc4d2aa21c363c3d6b1b0b96e85221b')
+DART_KEY    = (
     os.environ.get('DART_API_KEY') or
     os.environ.get('DART_KEY') or
     'bfc4e4e445de4727ae0bcc27e80ba5cf0e3818e6'
 )
-SHEET_ID  = os.environ.get('SHEET_ID', '1s73BDNtCPe5mOs9EjBE5npEfcaNtYRyWJxRBUmJI-WA')
-DART_BASE = "https://opendart.fss.or.kr/api"
+SHEET_ID    = os.environ.get('SHEET_ID', '1s73BDNtCPe5mOs9EjBE5npEfcaNtYRyWJxRBUmJI-WA')
+DART_BASE   = "https://opendart.fss.or.kr/api"
 SEIBRO_BASE = "https://seibro.or.kr/OpenPlatform/callOpenAPI.jsp"
 
 TARGET_YEARS = [2025]
-
-TEST_MODE  = False
-TEST_COUNT = 10
+TEST_MODE    = False
+TEST_COUNT   = 10
 
 # ============================================================
 # [Google Sheets 연결]
@@ -44,9 +43,9 @@ ws_master = sh.get_worksheet(0)
 AUDIT_SHEET_NAME = '감사보고서'
 
 # ============================================================
-# [DART 기업코드 딕셔너리] - main.py 와 동일 방식
+# [DART 기업코드 딕셔너리] stock_code_6 → corp_code
 # ============================================================
-DART_CORP_DICT = {}   # stock_code_6 → corp_code
+DART_CORP_DICT = {}
 
 def load_dart_corp_codes():
     global DART_CORP_DICT
@@ -65,13 +64,18 @@ def load_dart_corp_codes():
         print(f"  ⚠ 기업코드 로드 실패: {e}")
 
 # ============================================================
-# [SEIBRO로 xrc_stk_isin 조회] - main.py 와 동일 방식
+# [SEIBRO: 채권 ISIN → xrc_stk_isin]
+# main.py와 동일 방식. 결과를 캐시해서 재사용.
 # ============================================================
-def get_xrc_stk_isin(bond_isin):
-    """채권 ISIN → 주식 ISIN (xrc_stk_isin) 조회"""
-    params_str = f"BOND_ISIN:{bond_isin}"
-    url = f"{SEIBRO_BASE}?key={SEIBRO_KEY}&apiId=getXrcStkStatInfo&params={params_str}"
+_xrc_cache = {}   # bond_isin → xrc_stk_isin
+
+def get_xrc_stk_isin_cached(bond_isin):
+    if bond_isin in _xrc_cache:
+        return _xrc_cache[bond_isin]
+    val = ''
     try:
+        params_str = f"BOND_ISIN:{bond_isin}"
+        url = f"{SEIBRO_BASE}?key={SEIBRO_KEY}&apiId=getXrcStkStatInfo&params={params_str}"
         r = requests.get(url, timeout=10)
         for enc in ['utf-8', 'euc-kr']:
             try:
@@ -82,63 +86,42 @@ def get_xrc_stk_isin(bond_isin):
         else:
             decoded = r.content.decode('utf-8', errors='replace')
         cleaned = re.sub(r'<\?xml[^?]*\?>', '', decoded).strip()
-        if not cleaned:
-            return ''
-        root = ET.fromstring(cleaned.encode('utf-8'))
-        vector = root.find('.//vector')
-        if vector is None or vector.get('result', '0') == '0':
-            return ''
-        el = root.find('.//result')
-        if el is not None:
-            xrc_stk_isin = el.find('.//XRC_STK_ISIN')
-            if xrc_stk_isin is not None:
-                return xrc_stk_isin.get('value', '')
+        if cleaned:
+            root = ET.fromstring(cleaned.encode('utf-8'))
+            vector = root.find('.//vector')
+            if vector is not None and vector.get('result', '0') != '0':
+                el = root.find('.//result')
+                if el is not None:
+                    xrc = el.find('.//XRC_STK_ISIN')
+                    if xrc is not None:
+                        val = xrc.get('value', '')
     except Exception:
         pass
-    return ''
+    _xrc_cache[bond_isin] = val
+    return val
 
-def get_corp_code_by_name_api(corp_name):
-    """DART company.json으로 기업명 검색 → corp_code 반환"""
-    try:
-        r = requests.get(
-            f"{DART_BASE}/company.json",
-            params={'crtfc_key': DART_KEY, 'corp_name': corp_name},
-            timeout=10,
-        )
-        data = r.json()
-        if data.get('status') != '000':
-            return ''
-        items = data.get('list', [])
-        # 상장사 우선
-        listed = [x for x in items if x.get('stock_code', '').strip()]
-        for item in (listed or items):
-            code = item.get('corp_code', '')
-            if code:
-                return code
-    except Exception:
-        pass
-    return ''
-
-
-def get_corp_code(bond_isin, corp_name=''):
+# ============================================================
+# [corp_code 조회: SEIBRO → DART_CORP_DICT (main.py 동일 방식)]
+# ============================================================
+def get_corp_code_for_audit(bond_isin):
     """
-    채권 ISIN → corp_code 획득
-    1) SEIBRO xrc_stk_isin → stock_code_6 → DART_CORP_DICT
-    2) Fallback: DART company.json 기업명 검색 (호텔신라 등 dict 누락 케이스)
+    채권 ISIN → corp_code
+    SEIBRO로 xrc_stk_isin 조회 → stock_code_6 → DART_CORP_DICT
+    EB의 경우 교환 대상 주식 발행사가 아닌 사채 발행사가 필요하므로
+    stock_code 매칭 실패 시 DART_CORP_DICT 전체에서 ISIN 앞 6자리로도 시도
     """
-    xrc_stk_isin = get_xrc_stk_isin(bond_isin)
-    if xrc_stk_isin and len(xrc_stk_isin) >= 9:
-        stock_code_6 = xrc_stk_isin[3:9]
+    xrc = get_xrc_stk_isin_cached(bond_isin)
+    if xrc and len(xrc) >= 9:
+        stock_code_6 = xrc[3:9]
         corp_code = DART_CORP_DICT.get(stock_code_6, '')
         if corp_code:
             return corp_code
-        print(f"    ⚠ stock_code {stock_code_6} dict 미등록 → 기업명 검색 시도")
 
-    # Fallback: 기업명으로 검색
-    if corp_name:
-        corp_code = get_corp_code_by_name_api(corp_name)
+    # Fallback: 채권 ISIN 자체의 4~9번째 자리로 시도 (일부 CB/BW 케이스)
+    candidate = bond_isin[3:9] if len(bond_isin) >= 9 else ''
+    if candidate:
+        corp_code = DART_CORP_DICT.get(candidate, '')
         if corp_code:
-            print(f"    📌 corp_code(기업명검색): {corp_code} ({corp_name})")
             return corp_code
 
     return ''
@@ -178,43 +161,25 @@ def search_audit_report(corp_code, biz_year):
     end_de = f"{biz_year + 1}0630"
     audit_kws = ['감사보고서', '내부회계관리제도']
 
-    # 1차: pblntf_ty='A' 정기공시
-    try:
-        params = {
-            'crtfc_key': DART_KEY, 'corp_code': corp_code,
-            'bgn_de': bgn_de, 'end_de': end_de,
-            'page_count': 40, 'pblntf_ty': 'A',
-        }
-        r = requests.get(f"{DART_BASE}/list.json", params=params, timeout=10)
-        data = r.json()
-        if data.get('status') in ('000', '013'):
-            for item in (data.get('list') or []):
-                rpt = item.get('report_nm', '')
-                if '[첨부정정]' in rpt or '[첨부추가]' in rpt:
-                    continue
-                if any(kw in rpt for kw in audit_kws):
-                    return item.get('rcept_no'), rpt, item.get('rcept_dt', '')
-    except Exception as e:
-        print(f"    ⚠ A타입 검색 오류: {e}")
-
-    # 2차: 전체 타입
-    try:
-        params = {
-            'crtfc_key': DART_KEY, 'corp_code': corp_code,
-            'bgn_de': bgn_de, 'end_de': end_de, 'page_count': 40,
-        }
-        r = requests.get(f"{DART_BASE}/list.json", params=params, timeout=10)
-        data = r.json()
-        if data.get('status') in ('000', '013'):
-            for item in (data.get('list') or []):
-                rpt = item.get('report_nm', '')
-                if '[첨부정정]' in rpt or '[첨부추가]' in rpt:
-                    continue
-                if '감사보고서' in rpt:
-                    return item.get('rcept_no'), rpt, item.get('rcept_dt', '')
-    except Exception as e:
-        print(f"    ⚠ 전체타입 검색 오류: {e}")
-
+    for pblntf_ty in ['A', None]:
+        try:
+            params = {
+                'crtfc_key': DART_KEY, 'corp_code': corp_code,
+                'bgn_de': bgn_de, 'end_de': end_de, 'page_count': 40,
+            }
+            if pblntf_ty:
+                params['pblntf_ty'] = pblntf_ty
+            r = requests.get(f"{DART_BASE}/list.json", params=params, timeout=10)
+            data = r.json()
+            if data.get('status') in ('000', '013'):
+                for item in (data.get('list') or []):
+                    rpt = item.get('report_nm', '')
+                    if '[첨부정정]' in rpt or '[첨부추가]' in rpt:
+                        continue
+                    if any(kw in rpt for kw in audit_kws):
+                        return item.get('rcept_no'), rpt, item.get('rcept_dt', '')
+        except Exception as e:
+            print(f"    ⚠ 공시검색 오류: {e}")
     return None, None, None
 
 # ============================================================
@@ -249,7 +214,6 @@ def parse_audit_opinion(rcept_no):
             clean = re.sub(r'&nbsp;|&amp;|&lt;|&gt;', ' ', clean)
             clean = re.sub(r'\s+', ' ', clean)
 
-            # 감사의견
             for pattern in [
                 r'감사의견\s*[:：]\s*(적정|한정|부적정|의견\s*거절)',
                 r'(적정|한정|부적정|의견거절)\s*의견',
@@ -266,14 +230,12 @@ def parse_audit_opinion(rcept_no):
                         opinion = kw
                         break
 
-            # 감사인
             m = re.search(r'([가-힣]+\s*회계법인)', clean)
             if m:
                 auditor = m.group(0).strip()
 
             if opinion != '파악불가' or auditor:
                 break
-
     except Exception as e:
         print(f"    ⚠ 문서 파싱 실패: {e}")
     return opinion, auditor
@@ -291,37 +253,29 @@ def check_audit_reports():
         if len(row) > 1 and row[1].strip().startswith('KR')
            and row[0].strip() not in ('-', '')
     ]
-    # 중복 제거: corp_code 기준
-    # xrc_stk_isin이 같아도 발행사가 다른 경우 있음 (다솔 EB → 교환대상이 에르코스)
-    # → 먼저 corp_code를 구한 뒤, 같은 corp_code면 중복으로 처리
-    print("  🔄 corp_code 사전 조회 중 (중복 제거용)...")
+
+    # ── 중복 제거: corp_code 기준 ──
+    # SEIBRO는 여기서 1번만 호출하고 캐시에 저장 → 본 처리에서 재사용
+    print("  🔄 corp_code 사전 조회 중 (SEIBRO + DART_CORP_DICT)...")
     seen_corp_codes = set()
     deduped = []
     for h in holdings:
-        xrc = get_xrc_stk_isin(h['isin'])
-        h['xrc_stk_isin'] = xrc
-
-        # corp_code 임시 조회
-        corp_code = ''
-        if xrc and len(xrc) >= 9:
-            corp_code = DART_CORP_DICT.get(xrc[3:9], '')
-        if not corp_code:            corp_code = get_corp_code_by_name_api(h['name'])
-
+        corp_code = get_corp_code_for_audit(h['isin'])
         dedup_key = corp_code if corp_code else f"unknown_{h['isin']}"
-
         if dedup_key not in seen_corp_codes:
             seen_corp_codes.add(dedup_key)
-            h['corp_code_cache'] = corp_code   # 나중에 재사용
+            h['_corp_code'] = corp_code
             deduped.append(h)
         else:
             print(f"  ⏭ 중복 법인 스킵: {h['name']} ({h['isin']})")
+        time.sleep(0.8)   # SEIBRO 과호출 방지 (충분한 간격)
     holdings = deduped
 
     if TEST_MODE:
         holdings = holdings[:TEST_COUNT]
         print(f"🧪 테스트 모드: {TEST_COUNT}개\n")
     else:
-        print(f"🚀 전체 {len(holdings)}개 종목 확인 (중복 법인 제거 후)\n")
+        print(f"🚀 전체 {len(holdings)}개 종목 확인\n")
 
     today = datetime.now()
     deadline = datetime(2026, 3, 31)
@@ -332,29 +286,25 @@ def check_audit_reports():
         name      = h['name']
         isin      = h['isin']
         bond_type = h['bond_type']
+        corp_code = h.get('_corp_code', '')
+
         print(f"  🔍 {name} ({isin})", end=' ')
 
-        # corp_code: 사전 조회에서 캐시된 값 그대로 사용 (재호출 없음)
-        corp_code = h.get('_corp_code', '')
-        if corp_code:
-            print(f"→ corp_code: {corp_code}")
-        else:
-            print(f"→ ⚠ corp_code 없음")
+        if not corp_code:
             print(f"→ ⚠ corp_code 없음")
             results.append({
                 'name': name, 'isin': isin, 'bond_type': bond_type,
                 'biz_year': TARGET_YEARS[0],
                 'submitted': '확인불가', 'opinion': '-',
-                'rcept_dt': '-', 'auditor': '-', 'link': '-', 'note': 'corp_code 조회 실패',
+                'rcept_dt': '-', 'auditor': '-', 'link': '-',
+                'note': 'corp_code 조회 실패',
             })
-            time.sleep(0.5)
             continue
 
         print(f"→ corp_code: {corp_code}")
 
         for biz_year in TARGET_YEARS:
             rcept_no, rpt_nm, rcept_dt = search_audit_report(corp_code, biz_year)
-
             if rcept_no:
                 fmt_dt = f"{rcept_dt[:4]}-{rcept_dt[4:6]}-{rcept_dt[6:]}" if len(rcept_dt) == 8 else rcept_dt
                 print(f"    📄 {rpt_nm} ({fmt_dt})")
@@ -384,60 +334,49 @@ def check_audit_reports():
     return results
 
 # ============================================================
-# [시트 기록 - batch로 한 번에 처리해서 429 방지]
+# [시트 기록]
 # ============================================================
 def write_results_to_sheet(ws, results):
     if not results:
         print("  ⚠ 기록할 데이터 없음")
         return
 
-    rows = []
-    for r in results:
-        rows.append([
-            r['name'], r['isin'], r['bond_type'], str(r['biz_year']),
-            r['submitted'], r['opinion'], r['rcept_dt'], r['auditor'],
-            r['link'], r.get('note', ''),
-        ])
+    rows = [[
+        r['name'], r['isin'], r['bond_type'], str(r['biz_year']),
+        r['submitted'], r['opinion'], r['rcept_dt'], r['auditor'],
+        r['link'], r.get('note', ''),
+    ] for r in results]
 
     write_header(ws)
     time.sleep(2.0)
 
-    # ── 기존 데이터 전체 클리어 후 재기록 (잔여 행 완전 제거) ──
-    ws.batch_clear(['A2:J300'])   # 300행까지 확실히 클리어
+    ws.batch_clear(['A2:J300'])
     time.sleep(1.5)
 
     ws.update(rows, range_name=f'A2:J{len(rows)+1}')
     time.sleep(2.0)
 
-    # ── 색상: opinion별로 행 묶어서 batch 처리 (429 방지) ──
+    # 색상 batch 처리
     color_map = {
-        '적정':    {'red': 0.85, 'green': 0.95, 'blue': 0.85},
-        '한정':    {'red': 1.0,  'green': 0.95, 'blue': 0.7},
-        '부적정':  {'red': 1.0,  'green': 0.8,  'blue': 0.8},
-        '의견거절':{'red': 1.0,  'green': 0.8,  'blue': 0.8},
-        '미제출':  {'red': 0.97, 'green': 0.97, 'blue': 0.97},
-        '확인불가':{'red': 0.95, 'green': 0.9,  'blue': 1.0},
+        '적정':     {'red': 0.85, 'green': 0.95, 'blue': 0.85},
+        '한정':     {'red': 1.0,  'green': 0.95, 'blue': 0.7},
+        '부적정':   {'red': 1.0,  'green': 0.8,  'blue': 0.8},
+        '의견거절': {'red': 1.0,  'green': 0.8,  'blue': 0.8},
+        '미제출':   {'red': 0.97, 'green': 0.97, 'blue': 0.97},
+        '확인불가': {'red': 0.95, 'green': 0.9,  'blue': 1.0},
     }
-
-    # 색상별로 행 그룹핑 → batch_format 한 번에
     from collections import defaultdict
     color_rows = defaultdict(list)
     for i, r in enumerate(results, start=2):
-        op  = r['opinion']
-        sub = r['submitted']
-        key = op if op in color_map else sub
+        key = r['opinion'] if r['opinion'] in color_map else r['submitted']
         if key in color_map:
             color_rows[key].append(i)
 
-    formats = []
-    for key, row_idxs in color_rows.items():
-        color = color_map[key]
-        for idx in row_idxs:
-            formats.append({
-                'range': f'A{idx}:J{idx}',
-                'format': {'backgroundColor': color},
-            })
-
+    formats = [
+        {'range': f'A{idx}:J{idx}', 'format': {'backgroundColor': color_map[key]}}
+        for key, idxs in color_rows.items()
+        for idx in idxs
+    ]
     if formats:
         ws.batch_format(formats)
         time.sleep(1.0)
@@ -480,12 +419,9 @@ def print_summary(results):
 if __name__ == '__main__':
     print(f"🔑 DART_KEY: {DART_KEY[:6]}...")
     load_dart_corp_codes()
-
     ws_audit = get_or_create_audit_sheet()
     results  = check_audit_reports()
-
     print("\n📝 시트 기록 중...")
     write_results_to_sheet(ws_audit, results)
     print_summary(results)
-
     print(f"\n👉 https://docs.google.com/spreadsheets/d/{SHEET_ID}")
