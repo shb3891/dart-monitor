@@ -33,85 +33,136 @@ def seibro_call(api_id, params_dict):
     r = requests.get(url, timeout=10)
     return r.content.decode('utf-8', errors='replace')
 
-for name, isin in TARGETS.items():
-    print(f"\n{'='*70}")
-    print(f"🔍 {name} | {isin}")
-    print('='*70)
-
-    print(f"\n[1] getBondStatInfo")
-    print(seibro_call('getBondStatInfo', {'ISIN': isin})[:2000])
-
-    print(f"\n[2] getXrcStkStatInfo")
-    txt2 = seibro_call('getXrcStkStatInfo', {'BOND_ISIN': isin})
-    print(txt2[:2000])
-
-    xrc_match    = re.search(r'XRC_STK_ISIN[^>]*value="([^"]*)"', txt2)
-    xrc_stk_isin = xrc_match.group(1) if xrc_match else ''
-    stock_code_6 = xrc_stk_isin[3:9] if xrc_stk_isin and len(xrc_stk_isin)>=9 else ''
-    print(f"\n  → xrc_stk_isin: '{xrc_stk_isin}' / stock_code_6: '{stock_code_6}'")
-
-    print(f"\n[3] corp_code 탐색")
-    corp_code = ''
-    if stock_code_6:
-        corp_code = stock_to_corp.get(stock_code_6, '')
-        print(f"  stock_code '{stock_code_6}' → corp_code: '{corp_code}'")
-    if not corp_code:
-        for try_name in [name, name.replace('(주)','').strip()]:
-            if try_name in name_to_corp:
-                corp_code = name_to_corp[try_name]
-                print(f"  이름 정확매칭 '{try_name}' → corp_code: '{corp_code}'")
-                break
-        if not corp_code:
-            matches = [(n,c) for n,c in name_to_corp.items() if name in n or n in name]
-            print(f"  이름 부분매칭: {matches[:10]}")
-            if matches:
-                corp_code = min(matches, key=lambda x: len(x[0]))[1]
-                print(f"  → 선택: '{corp_code}'")
-
-    print(f"\n[4] DART list.json")
-    if corp_code:
-        for ptype in ['B', '']:
-            params = {
-                'crtfc_key': DART_KEY, 'corp_code': corp_code,
-                'bgn_de': '20220101', 'end_de': '20251231', 'page_count': 40,
-            }
-            if ptype:
-                params['pblntf_ty'] = ptype
-            r4  = requests.get(f"{DART_BASE}/list.json", params=params, timeout=10)
-            d4  = r4.json()
-            label = f"pblntf_ty=B" if ptype else "전체타입"
-            print(f"\n  [{label}] status={d4.get('status')}, 건수={len(d4.get('list',[]))}")
-            for itm in d4.get('list', []):
-                print(f"    {itm.get('rcept_dt')} | {itm.get('report_nm')[:60]} | {itm.get('rcept_no')}")
-    else:
-        print("  ⚠ corp_code 없음")
-
 # ── 이연제약 공시 본문 파싱 ──
-print(f"\n\n{'='*70}")
+print("="*70)
 print("📌 이연제약 공시 본문 - 전환청구기간 섹션 출력")
+print("="*70)
 
-# 위 [4] 결과에서 이연제약 발행결정 rcept_no 확인 후 아래에 직접 입력
-RCEPT_NO = ''  # ← 여기 채워서 2차 실행
+RCEPT_NO = '20241108000348'
 
-if RCEPT_NO:
-    r5 = requests.get(f"{DART_BASE}/document.xml",
-                      params={'crtfc_key': DART_KEY, 'rcept_no': RCEPT_NO}, timeout=30)
-    z5 = zipfile.ZipFile(io.BytesIO(r5.content))
-    for fname in z5.namelist():
-        if not any(fname.endswith(ext) for ext in ['.xml','.html','.htm']):
+r5 = requests.get(f"{DART_BASE}/document.xml",
+                  params={'crtfc_key': DART_KEY, 'rcept_no': RCEPT_NO}, timeout=30)
+print(f"document.xml 응답: {r5.status_code} / {len(r5.content):,} bytes")
+
+z5 = zipfile.ZipFile(io.BytesIO(r5.content))
+print(f"ZIP 내 파일: {z5.namelist()}")
+
+for fname in z5.namelist():
+    if not any(fname.endswith(ext) for ext in ['.xml', '.html', '.htm']):
+        continue
+    print(f"\n--- 파일: {fname} ---")
+    raw = z5.read(fname)
+    text = None
+    for enc in ['utf-8', 'euc-kr', 'cp949']:
+        try:
+            text = raw.decode(enc)
+            print(f"  인코딩: {enc}")
+            break
+        except:
             continue
-        raw = z5.read(fname)
-        for enc in ['utf-8','euc-kr','cp949']:
-            try: text = raw.decode(enc); break
-            except: continue
-        clean = re.sub(r'<[^>]+>', ' ', text)
-        clean = re.sub(r'&nbsp;', ' ', clean)
-        clean = re.sub(r'\s+', ' ', clean)
-        for kw in ['전환청구기간','전환청구 기간','전환권 행사','전환권행사','청구기간','권리행사']:
-            idx = clean.find(kw)
-            if idx >= 0:
-                print(f"\n  ▶ '{kw}' @ {idx}")
-                print(f"  {clean[max(0,idx-50):idx+700]}")
-                break
+    if not text:
+        print("  ⚠ 디코딩 실패")
+        continue
+
+    clean = re.sub(r'<[^>]+>', ' ', text)
+    clean = re.sub(r'&nbsp;', ' ', clean)
+    clean = re.sub(r'\s+', ' ', clean)
+
+    # 전환청구기간 관련 키워드 전체 탐색
+    keywords = [
+        '전환청구기간', '전환청구 기간', '전환권 행사', '전환권행사',
+        '청구기간', '권리행사', '전환기간', '행사기간',
+        '전환청구', '청구권 행사',
+    ]
+    found_any = False
+    for kw in keywords:
+        idx = clean.find(kw)
+        if idx >= 0:
+            print(f"\n  ▶ 키워드 '{kw}' @ {idx}")
+            print(f"  {clean[max(0,idx-100):idx+800]}")
+            print()
+            found_any = True
+
+    if not found_any:
+        print("  ⚠ 전환청구 관련 키워드 없음 - 전체 텍스트 앞 3000자 출력:")
+        print(clean[:3000])
+
+# ── 만호제강: 발행사 corp_code로 재검색 ──
+print("\n\n" + "="*70)
+print("📌 만호제강 - 발행사(만호제강) corp_code로 DART 검색")
+print("="*70)
+
+# 만호제강 발행사 이름으로 corp_code 찾기
+for try_name in ['만호제강', '만호제강(주)', '(주)만호제강']:
+    if try_name in name_to_corp:
+        mh_corp_code = name_to_corp[try_name]
+        print(f"  이름매칭 '{try_name}' → corp_code: '{mh_corp_code}'")
+        break
 else:
-    print("  → RCEPT_NO 미입력, 위 [4] 결과 확인 후 채워서 재실행하세요")
+    matches = [(n,c) for n,c in name_to_corp.items() if '만호' in n]
+    print(f"  '만호' 포함 기업: {matches[:10]}")
+    mh_corp_code = matches[0][1] if matches else ''
+
+if mh_corp_code:
+    for ptype in ['B', '']:
+        params = {
+            'crtfc_key': DART_KEY, 'corp_code': mh_corp_code,
+            'bgn_de': '20250101', 'end_de': '20260331', 'page_count': 40,
+        }
+        if ptype:
+            params['pblntf_ty'] = ptype
+        r_mh = requests.get(f"{DART_BASE}/list.json", params=params, timeout=10)
+        d_mh = r_mh.json()
+        label = "pblntf_ty=B" if ptype else "전체타입"
+        print(f"\n  [{label}] status={d_mh.get('status')}, 건수={len(d_mh.get('list',[]))}")
+        for itm in d_mh.get('list', []):
+            print(f"    {itm.get('rcept_dt')} | {itm.get('report_nm')[:60]} | {itm.get('rcept_no')}")
+
+# ── 한진: [첨부추가] 공시 본문 파싱 ──
+print("\n\n" + "="*70)
+print("📌 한진 - [첨부추가] 공시 본문 파싱")
+print("="*70)
+
+HANJIN_RCEPT = '20230711000434'
+
+r6 = requests.get(f"{DART_BASE}/document.xml",
+                  params={'crtfc_key': DART_KEY, 'rcept_no': HANJIN_RCEPT}, timeout=30)
+print(f"document.xml 응답: {r6.status_code} / {len(r6.content):,} bytes")
+
+z6 = zipfile.ZipFile(io.BytesIO(r6.content))
+print(f"ZIP 내 파일: {z6.namelist()}")
+
+for fname in z6.namelist():
+    if not any(fname.endswith(ext) for ext in ['.xml', '.html', '.htm']):
+        continue
+    print(f"\n--- 파일: {fname} ---")
+    raw = z6.read(fname)
+    text = None
+    for enc in ['utf-8', 'euc-kr', 'cp949']:
+        try:
+            text = raw.decode(enc)
+            break
+        except:
+            continue
+    if not text:
+        continue
+
+    clean = re.sub(r'<[^>]+>', ' ', text)
+    clean = re.sub(r'&nbsp;', ' ', clean)
+    clean = re.sub(r'\s+', ' ', clean)
+
+    keywords = [
+        '전환청구기간', '전환청구 기간', '전환권 행사', '전환권행사',
+        '청구기간', '권리행사', '전환기간', '행사기간',
+    ]
+    found_any = False
+    for kw in keywords:
+        idx = clean.find(kw)
+        if idx >= 0:
+            print(f"\n  ▶ 키워드 '{kw}' @ {idx}")
+            print(f"  {clean[max(0,idx-100):idx+800]}")
+            found_any = True
+
+    if not found_any:
+        print("  ⚠ 키워드 없음 - 전체 텍스트 앞 3000자:")
+        print(clean[:3000])
