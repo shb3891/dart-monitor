@@ -799,6 +799,76 @@ async def main():
     print(f"  ✅ T열    YTC       ← DART ({ytc_c}/{len(results)}개)")
     print(f"  ⏳ P열    YTP (추후)")
 
+    # ── 주식코드 시트 업데이트 ──
+    await update_stock_code_sheet(data_rows, results)
+
+
+# ============================================================
+# [주식코드 시트 업데이트]
+# 시트명: "주식코드"
+# 컬럼: A 종목명 | B 채권ISIN | C 종류 | D 발행사 주식코드 | E 교환대상 주식코드
+# ============================================================
+async def update_stock_code_sheet(data_rows, results):
+    print("\n📊 주식코드 시트 업데이트 중...")
+
+    STOCK_SHEET_NAME = '주식코드'
+
+    # 시트 가져오기 or 생성
+    try:
+        ws_stock = sh.worksheet(STOCK_SHEET_NAME)
+    except Exception:
+        ws_stock = sh.add_worksheet(title=STOCK_SHEET_NAME, rows=200, cols=6)
+        print(f"  ✅ '{STOCK_SHEET_NAME}' 시트 새로 생성")
+
+    # 헤더
+    headers = ['종목명', '채권ISIN', '종류', '발행사 주식코드', '교환대상 주식코드']
+    ws_stock.update([headers], range_name='A1:E1')
+    ws_stock.format('A1:E1', {
+        'textFormat': {'bold': True},
+        'backgroundColor': {'red': 0.2, 'green': 0.5, 'blue': 0.3},
+        'horizontalAlignment': 'CENTER',
+    })
+    await asyncio.sleep(1.0)
+
+    # 데이터: 종목별 주식코드 수집
+    rows = []
+    for (sheet_row, row), (_, result) in zip(data_rows, results):
+        isin      = row[1].strip()
+        bond_type = result['basic_row'][1] if result['basic_row'] else row[3].strip()
+        name      = result['corp_name']
+
+        # xrc_stk_isin → 주식코드 6자리
+        xrc_stk_isin = ''
+        stock_code   = ''
+        try:
+            ex = parse_exercise_info(isin)
+            xrc_stk_isin = ex.get('xrc_stk_isin', '')
+            if xrc_stk_isin and len(xrc_stk_isin) >= 9:
+                stock_code = xrc_stk_isin[3:9]
+        except Exception:
+            pass
+
+        # CB/BW: 발행사=교환대상 동일
+        # EB: 발행사 ≠ 교환대상 (교환대상이 xrc_stk_isin)
+        if bond_type == 'EB':
+            issuer_code = ''        # EB는 발행사 주식코드 별도 조회 필요
+            target_code = stock_code
+        else:
+            issuer_code = stock_code
+            target_code = stock_code
+
+        rows.append([name, isin, bond_type, issuer_code, target_code])
+        await asyncio.sleep(0.3)
+
+    if rows:
+        # 기존 데이터 클리어 후 재기록
+        ws_stock.batch_clear([f'A2:E{len(rows)+10}'])
+        await asyncio.sleep(1.0)
+        ws_stock.update(rows, range_name=f'A2:E{len(rows)+1}')
+        await asyncio.sleep(1.0)
+
+    print(f"  ✅ 주식코드 시트 업데이트 완료: {len(rows)}개")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
