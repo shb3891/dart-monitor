@@ -60,9 +60,10 @@ DART_BASE   = "https://opendart.fss.or.kr/api"
 # [DART 기업코드 딕셔너리]
 # ============================================================
 DART_CORP_DICT = {}
+DART_NAME_DICT = {}  # 기업명 → corp_code (전체, 비상장 포함)
 
 def load_dart_corp_codes():
-    global DART_CORP_DICT
+    global DART_CORP_DICT, DART_NAME_DICT
     try:
         print("  📥 DART 기업코드 전체 다운로드 중...")
         r = requests.get(f"{DART_BASE}/corpCode.xml", params={'crtfc_key': DART_KEY}, timeout=30)
@@ -73,10 +74,13 @@ def load_dart_corp_codes():
         for item in root.findall('.//list'):
             corp_code  = item.findtext('corp_code', '').strip()
             stock_code = item.findtext('stock_code', '').strip()
+            corp_name  = item.findtext('corp_name', '').strip()
             if stock_code and len(stock_code) == 6:
                 DART_CORP_DICT[stock_code] = corp_code
                 count += 1
-        print(f"  ✅ DART 기업코드 로드 완료: {count:,}개 (상장사)")
+            if corp_name and corp_code:
+                DART_NAME_DICT[corp_name] = corp_code
+        print(f"  ✅ DART 기업코드 로드 완료: {count:,}개 (상장사), 이름사전 {len(DART_NAME_DICT):,}개")
     except Exception as e:
         print(f"  ⚠ DART 기업코드 로드 실패: {e}")
 
@@ -156,9 +160,7 @@ def parse_korean_date(text):
 
 
 def find_next_upcoming_row(rows):
-    # ── 날짜 역전된 행 필터링 (from > to 인 경우 제외) ──
     valid_rows = [(f, t, p) for f, t, p in rows if f <= t]
-    # 모두 역전이면 그냥 빈 값 반환 (역전 데이터를 시트에 쓰지 않음)
     if not valid_rows:
         return '', '', ''
     for from_dt, to_dt, pay_dt in valid_rows:
@@ -210,58 +212,124 @@ def dart_get_corp_code(stock_code_6):
     return corp_code
 
 
-# ── 개선 1: 공시 검색 범위 확대 + 정정 공시 수용 ──────────────────
 def dart_search_cb_disclosure(corp_code, issu_dt_str):
     """
-    발행일 기준 -90일 ~ +30일로 범위 확대.
-    [기재정정] 공시도 수용 (회차 정정 케이스 대응).
+    발행일 기준 -90일 ~ +30일로 범위 검색.
+    [기재정정] 우선 수용, [첨부정정] 스킵, [첨부추가] 수용.
+    B타입 실패 시 전체타입 재검색.
+    반환값: (기재정정_rcept_no, 원본_rcept_no) 튜플
     """
     try:
         issu_date = datetime.strptime(issu_dt_str, '%Y-%m-%d')
-        bgn_de = (issu_date - timedelta(days=90)).strftime('%Y%m%d')   # -60 → -90
-        end_de = (issu_date + timedelta(days=30)).strftime('%Y%m%d')   # +10 → +30
-        params = {
-            'crtfc_key': DART_KEY, 'corp_code': corp_code,
-            'pblntf_ty': 'B', 'bgn_de': bgn_de,
-            'end_de': end_de, 'page_count': 40,   # 20 → 40
-        }
-        r = requests.get(f"{DART_BASE}/list.json", params=params, timeout=10)
-        data = r.json()
-        print(f"    🌐 DART list: {data.get('status')} ({bgn_de}~{end_de})")
-        if data.get('status') not in ('000', '013'):
-            return None
+        bgn_de = (issu_date - timedelta(days=90)).strftime('%Y%m%d')
+        end_de = (issu_date + timedelta(days=30)).strftime('%Y%m%d')
+
         issue_kws = [
             '전환사채권발행결정', '교환사채권발행결정', '신주인수권부사채권발행결정',
         ]
-        # 정정 공시 키워드
         correction_kws = [
             '[기재정정]전환사채권발행결정', '[기재정정]교환사채권발행결정',
             '[기재정정]신주인수권부사채권발행결정',
         ]
-        # ── 추가: 대기업 EB 등 pblntf_ty='A'(정기공시) 포함 재검색용 ──
-        items = data.get('list', [])
-        print(f"    📋 공시 {len(items)}건")
 
-        # 우선순위: 기재정정 → 원본 발행결정 (첨부정정은 제외)
-        for priority_kws in [correction_kws, issue_kws]:
+        for pblntf_ty in ['B', '']:
+            params = {
+                'crtfc_key': DART_KEY, 'corp_code': corp_code,
+                'bgn_de': bgn_de, 'end_de': end_de, 'page_count': 40,
+            }
+            if pblntf_ty:
+                params['pblntf_ty'] = pblntf_ty
+
+            r = requests.get(f"{DART_BASE}/list.json", params=params, timeout=10)
+            data = r.json()
+            label = "B타입" if pblntf_ty else "전체타입"
+            print(f"    🌐 DART list({label}): {data.get('status')} ({bgn_de}~{end_de})")
+
+            if data.get('status') not in ('000', '013'):
+                continue
+
+            items = data.get('list', [])
+            print(f"    📋 공시 {len(items)}건 ({label})")
+
+            correction_no = ''
+            original_no   = ''
+
             for item in items:
                 rpt = item.get('report_nm', '')
-                # [첨부정정]은 본문이 없는 껍데기 공시 → 스킵
+                rcept_no = item.get('rcept_no', '')
+
+                # [첨부정정]은 본문 없는 껍데기 → 스킵
                 if '[첨부정정]' in rpt:
                     print(f"    ⏭ 첨부정정 스킵: {rpt}")
                     continue
-                if any(kw in rpt for kw in priority_kws):
-                    rcept_no = item.get('rcept_no')
-                    print(f"    📄 발견: {rpt} ({rcept_no})")
-                    return rcept_no
+
+                # [첨부추가]는 수용 (한진 케이스)
+                # [기재정정] 우선 저장
+                if any(kw in rpt for kw in correction_kws):
+                    if not correction_no:
+                        correction_no = rcept_no
+                        print(f"    📄 기재정정 발견: {rpt} ({rcept_no})")
+
+                # 원본 발행결정 저장
+                elif any(kw in rpt for kw in issue_kws):
+                    if not original_no:
+                        original_no = rcept_no
+                        print(f"    📄 원본 발견: {rpt} ({rcept_no})")
+
+                # [첨부추가] 케이스 - 원본으로 취급
+                elif '[첨부추가]' in rpt and any(kw in rpt for kw in [
+                    '전환사채권발행결정', '교환사채권발행결정', '신주인수권부사채권발행결정'
+                ]):
+                    if not original_no:
+                        original_no = rcept_no
+                        print(f"    📄 첨부추가 발견: {rpt} ({rcept_no})")
+
+            if correction_no or original_no:
+                return correction_no, original_no
 
         print("    ℹ 발행결정 공시 없음")
     except Exception as e:
         print(f"    ⚠ DART 공시검색 실패: {e}")
-    return None
+    return '', ''
 
 
-def dart_parse_disclosure(rcept_no, xrc_price=''):
+def _parse_document_text(rcept_no):
+    """공시 본문을 받아 clean text로 반환"""
+    try:
+        r = requests.get(
+            f"{DART_BASE}/document.xml",
+            params={'crtfc_key': DART_KEY, 'rcept_no': rcept_no},
+            timeout=30
+        )
+        z = zipfile.ZipFile(io.BytesIO(r.content))
+        for fname in z.namelist():
+            if not any(fname.endswith(ext) for ext in ['.xml', '.html', '.htm']):
+                continue
+            raw = z.read(fname)
+            for enc in ['utf-8', 'euc-kr', 'cp949']:
+                try:
+                    text = raw.decode(enc)
+                    break
+                except Exception:
+                    continue
+            else:
+                continue
+            clean = re.sub(r'<[^>]+>', ' ', text)
+            clean = re.sub(r'&nbsp;', ' ', clean)
+            clean = re.sub(r'\s+', ' ', clean)
+            return clean
+    except Exception as e:
+        print(f"    ⚠ 문서 로드 실패 ({rcept_no}): {e}")
+    return ''
+
+
+def dart_parse_disclosure(correction_rcept_no, original_rcept_no, xrc_price=''):
+    """
+    기재정정 공시와 원본 공시를 모두 파싱.
+    - 전환청구 시작일: 원본 공시에서 우선 파싱
+    - 전환청구 종료일: 기재정정 공시에서 우선 파싱 (변경된 값)
+    - 나머지: 기재정정 → 원본 순서로 파싱
+    """
     result = {
         'ytm': '', 'rfxg_floor': '',
         'xrc_begin_dart': '', 'xrc_end_dart': '',
@@ -269,234 +337,298 @@ def dart_parse_disclosure(rcept_no, xrc_price=''):
         'call_ratio': '', 'call_begin': '', 'call_end': '',
         'ytc': '',
     }
-    try:
-        r = requests.get(
-            f"{DART_BASE}/document.xml",
-            params={'crtfc_key': DART_KEY, 'rcept_no': rcept_no},
-            timeout=30
-        )
-        print(f"    🌐 document API: {r.status_code} / {len(r.content):,} bytes")
-        z = zipfile.ZipFile(io.BytesIO(r.content))
-        for fname in z.namelist():
-            if not any(fname.endswith(ext) for ext in ['.xml', '.html', '.htm']):
-                continue
-            raw = z.read(fname)
-            text = None
-            for enc in ['utf-8', 'euc-kr', 'cp949']:
+
+    # 텍스트 로드 (기재정정 + 원본)
+    correction_text = _parse_document_text(correction_rcept_no) if correction_rcept_no else ''
+    original_text   = _parse_document_text(original_rcept_no)   if original_rcept_no   else ''
+
+    print(f"    🌐 document API: 기재정정={bool(correction_text)}, 원본={bool(original_text)}")
+
+    # 파싱은 원본 우선 → 기재정정으로 보완하는 텍스트 리스트
+    # (전환청구 시작일은 원본에 있고, 종료일은 기재정정에서 바뀔 수 있음)
+    texts_primary   = [t for t in [original_text, correction_text] if t]   # 원본 우선
+    texts_correction = [t for t in [correction_text, original_text] if t]  # 기재정정 우선
+
+    def parse_from_texts(texts, parse_fn):
+        for text in texts:
+            val = parse_fn(text)
+            if val:
+                return val
+        return ''
+
+    # ── YTM ──
+    def _ytm(clean):
+        for pat in [
+            r'만기이자율[^0-9\n]*([0-9]+(?:\.[0-9]+)?)',
+            r'만기\s*이자율[^0-9\n]*([0-9]+(?:\.[0-9]+)?)',
+            r'만기보장수익률[^0-9\n]*([0-9]+(?:\.[0-9]+)?)',
+            r'만기\s*보장\s*수익률[^0-9\n]*([0-9]+(?:\.[0-9]+)?)',
+            r'만기\s*상환\s*이율[^0-9\n]*([0-9]+(?:\.[0-9]+)?)',
+            r'표면이자율[^0-9\n]*([0-9]+(?:\.[0-9]+)?)',
+            r'권면이자율[^0-9\n]*([0-9]+(?:\.[0-9]+)?)',
+        ]:
+            m = re.search(pat, clean)
+            if m:
                 try:
-                    text = raw.decode(enc)
-                    break
+                    val = float(m.group(1))
+                    if val < 100:
+                        return m.group(1)
                 except Exception:
-                    continue
-            if not text:
+                    pass
+        return ''
+
+    result['ytm'] = parse_from_texts(texts_primary, _ytm)
+    if result['ytm']:
+        print(f"    ✅ YTM: {result['ytm']}%")
+
+    # ── 리픽싱플로어 ──
+    def _rfxg(clean):
+        m = re.search(r'최저\s*(?:조정|전환|행사)\s*가액[^0-9\n]*?(-|–|[0-9][0-9,]+)', clean)
+        if m:
+            val = m.group(1).strip()
+            if val in ('-', '–'):
+                return xrc_price
+            val_n = val.replace(',', '')
+            try:
+                n = int(float(val_n))
+                if n > 100:
+                    return f"{n:,}"
+            except Exception:
+                pass
+        return ''
+
+    result['rfxg_floor'] = parse_from_texts(texts_primary, _rfxg)
+    if not result['rfxg_floor'] and xrc_price:
+        result['rfxg_floor'] = xrc_price
+        print(f"    ✅ 리픽싱플로어: 미기재→행사가액={xrc_price}")
+    elif result['rfxg_floor']:
+        print(f"    ✅ 리픽싱플로어: {result['rfxg_floor']}")
+
+    # ── 전환청구기간 ──
+    # 시작일: 원본 우선, 종료일: 기재정정 우선
+    def _xrc_dates(clean):
+        begin, end = '', ''
+        for kw in ['전환청구기간', '교환청구기간', '행사청구기간', '권리행사기간', '전환권 행사', '전환권행사']:
+            idx = clean.find(kw)
+            if idx < 0:
                 continue
-            clean = re.sub(r'<[^>]+>', ' ', text)
-            clean = re.sub(r'&nbsp;', ' ', clean)
-            clean = re.sub(r'\s+', ' ', clean)
+            section = clean[idx: idx + 800]
 
-            # ── 개선 2: YTM 파싱 패턴 확장 ───────────────────────────────
-            for pat in [
-                r'만기이자율[^0-9\n]*([0-9]+(?:\.[0-9]+)?)',
-                r'만기\s*이자율[^0-9\n]*([0-9]+(?:\.[0-9]+)?)',
-                r'만기보장수익률[^0-9\n]*([0-9]+(?:\.[0-9]+)?)',      # 추가
-                r'만기\s*보장\s*수익률[^0-9\n]*([0-9]+(?:\.[0-9]+)?)', # 추가
-                r'만기\s*상환\s*이율[^0-9\n]*([0-9]+(?:\.[0-9]+)?)',   # 추가
-                r'표면이자율[^0-9\n]*([0-9]+(?:\.[0-9]+)?)',            # 추가 (0% 케이스)
-                r'권면이자율[^0-9\n]*([0-9]+(?:\.[0-9]+)?)',            # 추가
-            ]:
-                m = re.search(pat, clean)
-                if m:
-                    try:
-                        val = float(m.group(1))
-                        if val < 100:
-                            result['ytm'] = m.group(1)
-                            print(f"    ✅ YTM: {val}%")
-                            break
-                    except Exception:
-                        pass
-
-            # 2) 리픽싱플로어
-            rfxg_m = re.search(
-                r'최저\s*(?:조정|전환|행사)\s*가액[^0-9\n]*?(-|–|[0-9][0-9,]+)', clean
+            m_b = (
+                re.search(r'시작일[^0-9\n]*(\d{4}년\s*\d{1,2}월\s*\d{1,2}일)', section) or
+                re.search(r'시작일[^0-9\n]*(\d{4}-\d{2}-\d{2})', section) or
+                re.search(r'시작일[^0-9\n]*(\d{4}\.\d{1,2}\.\d{1,2})', section) or
+                re.search(r'(\d{4}년\s*\d{1,2}월\s*\d{1,2}일)\s*부터', section) or
+                re.search(r'부터[^0-9\n]*(\d{4}년\s*\d{1,2}월\s*\d{1,2}일)', section)
             )
-            if rfxg_m:
-                val = rfxg_m.group(1).strip()
-                if val in ('-', '–'):
-                    result['rfxg_floor'] = xrc_price
-                    print(f"    ✅ 리픽싱플로어: 없음(-)→ 행사가액={xrc_price}")
-                else:
-                    val_n = val.replace(',', '')
-                    try:
-                        n = int(float(val_n))
-                        if n > 100:
-                            result['rfxg_floor'] = f"{n:,}"
-                            print(f"    ✅ 리픽싱플로어: {result['rfxg_floor']}")
-                    except Exception:
-                        pass
-            else:
-                if xrc_price:
-                    result['rfxg_floor'] = xrc_price
-                    print(f"    ✅ 리픽싱플로어: 미기재→ 행사가액={xrc_price}")
+            m_e = (
+                re.search(r'종료일[^0-9\n]*(\d{4}년\s*\d{1,2}월\s*\d{1,2}일)', section) or
+                re.search(r'종료일[^0-9\n]*(\d{4}-\d{2}-\d{2})', section) or
+                re.search(r'종료일[^0-9\n]*(\d{4}\.\d{1,2}\.\d{1,2})', section) or
+                re.search(r'(\d{4}년\s*\d{1,2}월\s*\d{1,2}일)\s*까지', section) or
+                re.search(r'까지[^0-9\n]*(\d{4}년\s*\d{1,2}월\s*\d{1,2}일)', section)
+            )
 
-            # 3) 전환청구기간
-            for kw in ['전환청구기간', '교환청구기간', '행사청구기간', '권리행사기간', '전환권 행사']:
-                idx = clean.find(kw)
-                if idx < 0:
-                    continue
-                section = clean[idx: idx + 500]
-                m_b = re.search(r'시작일[^0-9\n]*(\d{4}년\s*\d{1,2}월\s*\d{1,2}일)', section)
-                m_e = re.search(r'종료일[^0-9\n]*(\d{4}년\s*\d{1,2}월\s*\d{1,2}일)', section)
-                if not m_b:
-                    m_b = re.search(r'시작일[^0-9\n]*(\d{4}-\d{2}-\d{2})', section)
-                if not m_e:
-                    m_e = re.search(r'종료일[^0-9\n]*(\d{4}-\d{2}-\d{2})', section)
-                if m_b:
-                    result['xrc_begin_dart'] = parse_korean_date(m_b.group(1))
-                    print(f"    ✅ 전환청구시작: {result['xrc_begin_dart']}")
-                if m_e:
-                    result['xrc_end_dart'] = parse_korean_date(m_e.group(1))
-                    print(f"    ✅ 전환청구종료: {result['xrc_end_dart']}")
-                if result['xrc_begin_dart'] or result['xrc_end_dart']:
-                    break
+            # ~ 범위 패턴
+            if not m_b and not m_e:
+                range_m = re.search(
+                    r'(\d{4}년\s*\d{1,2}월\s*\d{1,2}일|\d{4}-\d{2}-\d{2}|\d{4}\.\d{2}\.\d{2})'
+                    r'\s*[~∼]\s*'
+                    r'(\d{4}년\s*\d{1,2}월\s*\d{1,2}일|\d{4}-\d{2}-\d{2}|\d{4}\.\d{2}\.\d{2})',
+                    section
+                )
+                if range_m:
+                    begin = parse_korean_date(range_m.group(1))
+                    end   = parse_korean_date(range_m.group(2))
 
-            # 4) PUT
-            put_idx = -1
-            for kw in ['조기상환 청구기간', '조기상환청구기간', '[조기상환청구권', '조기상환청구권(Put']:
-                idx = clean.find(kw)
-                if idx >= 0:
-                    put_idx = idx
-                    break
-            if put_idx >= 0:
-                put_section = clean[put_idx: put_idx + 5000]
-                dates = re.findall(r'\d{4}-\d{2}-\d{2}', put_section)
-                rows = [(dates[i*3], dates[i*3+1], dates[i*3+2]) for i in range(len(dates) // 3)]
-                if rows:
-                    f, t, p = find_next_upcoming_row(rows)
-                    result['put_begin'] = f
-                    result['put_end']   = t
-                    result['put_date']  = p
-                    print(f"    ✅ PUT: {f}~{t}, 상환: {p}")
-            else:
-                result['put_begin'] = '-'
-                result['put_end']   = '-'
-                result['put_date']  = '-'
-                print("    ℹ PUT 없음(-)")
+            if m_b:
+                begin = parse_korean_date(m_b.group(1))
+            if m_e:
+                end = parse_korean_date(m_e.group(1))
 
-            # ── 개선 3: CALL 비율 패턴 확장 ──────────────────────────────
-            call_idx = -1
-            for kw in [
-                '매도청구권(Call Option)', '매도청구권(call option)',
-                '[매도청구권', '매도청구권에 관한', '매도 청구권', '콜옵션', '콜 옵션',
-            ]:
-                m_idx = re.search(re.escape(kw), clean, re.IGNORECASE)
-                if m_idx:
-                    call_idx = m_idx.start()
-                    break
-            if call_idx >= 0:
-                call_section = clean[call_idx: call_idx + 5000]
-                ytc_m = re.search(r'연\s*단리\s*([0-9]+(?:\.[0-9]+)?)\s*%', call_section)
-                if ytc_m:
-                    result['ytc'] = ytc_m.group(1)
-                    print(f"    ✅ YTC: {result['ytc']}%")
+            if begin or end:
+                break
+        return begin, end
 
-                # CALL 비율 패턴 (기존 + 추가)
-                for ratio_pat in [
-                    r'([0-9]+(?:\.[0-9]+)?)%를?\s*총\s*한도',
-                    r'\(Call\s*Option\s*([0-9]+(?:\.[0-9]+)?)\s*%\)',
-                    r'Call\s*Option\s*([0-9]+(?:\.[0-9]+)?)\s*%',
-                    r'전자등록총액\s*([0-9]+(?:\.[0-9]+)?)\s*%',
-                    r'발행총액[^0-9]*([0-9]+(?:\.[0-9]+)?)\s*%',
-                    # ── 아래부터 추가 ──
-                    r'사채\s*원금의\s*([0-9]+(?:\.[0-9]+)?)\s*%',      # "사채 원금의 30%"
-                    r'잔액의\s*([0-9]+(?:\.[0-9]+)?)\s*%',             # "잔액의 30%"
-                    r'([0-9]+(?:\.[0-9]+)?)\s*%\s*이내',               # "30% 이내"
-                    r'한도\s*[:：]\s*([0-9]+(?:\.[0-9]+)?)\s*%',       # "한도: 30%"
-                    r'총액의\s*([0-9]+(?:\.[0-9]+)?)\s*%',             # "총액의 30%"
-                    r'권면총액의\s*([0-9]+(?:\.[0-9]+)?)\s*%',         # "권면총액의 30%"
-                ]:
-                    ratio_m = re.search(ratio_pat, call_section, re.IGNORECASE)
-                    if ratio_m:
-                        try:
-                            val = float(ratio_m.group(1))
-                            if val <= 100:
-                                result['call_ratio'] = ratio_m.group(1)
-                                print(f"    ✅ CALL비율: {result['call_ratio']}%")
-                                break
-                        except Exception:
-                            pass
+    # 시작일: 원본 우선
+    for text in texts_primary:
+        b, e = _xrc_dates(text)
+        if b:
+            result['xrc_begin_dart'] = b
+            break
+    # 종료일: 기재정정 우선 (정정된 값 반영)
+    for text in texts_correction:
+        b, e = _xrc_dates(text)
+        if e:
+            result['xrc_end_dart'] = e
+            break
 
-                call_dates = re.findall(r'\d{4}-\d{2}-\d{2}', call_section)
-                call_rows = [(call_dates[i*3], call_dates[i*3+1], call_dates[i*3+2]) for i in range(len(call_dates) // 3)]
-                if call_rows:
-                    f, t, _ = find_next_upcoming_row(call_rows)
-                    result['call_begin'] = f
-                    result['call_end']   = t
-                    print(f"    ✅ CALL일정: {f}~{t}")
-                else:
-                    # 한국어 날짜 패턴 (부터/까지 또는 ~)
-                    b_m = re.search(r'(\d{4}년\s*\d{1,2}월\s*\d{1,2}일)부터', call_section)
-                    e_m = re.search(r'(\d{4}년\s*\d{1,2}월\s*\d{1,2}일)까지', call_section)
-                    if not b_m:
-                        # "YYYY년 MM월 DD일 ~ YYYY년 MM월 DD일" 형태
-                        range_m = re.search(
-                            r'(\d{4}년\s*\d{1,2}월\s*\d{1,2}일)\s*~\s*(\d{4}년\s*\d{1,2}월\s*\d{1,2}일)',
-                            call_section
-                        )
-                        if range_m:
-                            b_m = type('m', (), {'group': lambda self, n: range_m.group(n)})()
-                            b_m.group = lambda n: range_m.group(1) if n == 1 else ''
-                            e_m = type('m', (), {'group': lambda self, n: range_m.group(2)})()
-                            e_m.group = lambda n: range_m.group(2) if n == 1 else ''
-                    if b_m:
-                        result['call_begin'] = parse_korean_date(b_m.group(1))
-                    if e_m:
-                        result['call_end'] = parse_korean_date(e_m.group(1))
-                    if result['call_begin']:
-                        print(f"    ✅ CALL일정(한국어): {result['call_begin']}~{result['call_end']}")
-            else:
-                result['call_begin'] = '-'
-                result['call_end']   = '-'
-                result['call_ratio'] = '-'
-                print("    ℹ CALL 없음(-)")
+    if result['xrc_begin_dart']:
+        print(f"    ✅ 전환청구시작: {result['xrc_begin_dart']}")
+    if result['xrc_end_dart']:
+        print(f"    ✅ 전환청구종료: {result['xrc_end_dart']}")
 
-    except Exception as e:
-        print(f"    ⚠ DART 문서 파싱 실패: {e}")
+    # ── PUT ──
+    def _put(clean):
+        put_idx = -1
+        for kw in ['조기상환 청구기간', '조기상환청구기간', '[조기상환청구권', '조기상환청구권(Put']:
+            idx = clean.find(kw)
+            if idx >= 0:
+                put_idx = idx
+                break
+        if put_idx >= 0:
+            put_section = clean[put_idx: put_idx + 5000]
+            dates = re.findall(r'\d{4}-\d{2}-\d{2}', put_section)
+            rows = [(dates[i*3], dates[i*3+1], dates[i*3+2]) for i in range(len(dates) // 3)]
+            if rows:
+                return find_next_upcoming_row(rows)
+        return None
+
+    for text in texts_primary:
+        put_result = _put(text)
+        if put_result is not None:
+            f, t, p = put_result
+            result['put_begin'] = f
+            result['put_end']   = t
+            result['put_date']  = p
+            print(f"    ✅ PUT: {f}~{t}, 상환: {p}")
+            break
+    else:
+        result['put_begin'] = '-'
+        result['put_end']   = '-'
+        result['put_date']  = '-'
+        print("    ℹ PUT 없음(-)")
+
+    # ── CALL ──
+    def _call(clean):
+        call_idx = -1
+        for kw in [
+            '매도청구권(Call Option)', '매도청구권(call option)',
+            '[매도청구권', '매도청구권에 관한', '매도 청구권', '콜옵션', '콜 옵션',
+        ]:
+            m_idx = re.search(re.escape(kw), clean, re.IGNORECASE)
+            if m_idx:
+                call_idx = m_idx.start()
+                break
+        if call_idx < 0:
+            return None
+
+        call_section = clean[call_idx: call_idx + 5000]
+        ytc, ratio, begin, end = '', '', '', ''
+
+        ytc_m = re.search(r'연\s*단리\s*([0-9]+(?:\.[0-9]+)?)\s*%', call_section)
+        if ytc_m:
+            ytc = ytc_m.group(1)
+
+        for ratio_pat in [
+            r'([0-9]+(?:\.[0-9]+)?)%를?\s*총\s*한도',
+            r'\(Call\s*Option\s*([0-9]+(?:\.[0-9]+)?)\s*%\)',
+            r'Call\s*Option\s*([0-9]+(?:\.[0-9]+)?)\s*%',
+            r'전자등록총액\s*([0-9]+(?:\.[0-9]+)?)\s*%',
+            r'발행총액[^0-9]*([0-9]+(?:\.[0-9]+)?)\s*%',
+            r'사채\s*원금의\s*([0-9]+(?:\.[0-9]+)?)\s*%',
+            r'잔액의\s*([0-9]+(?:\.[0-9]+)?)\s*%',
+            r'([0-9]+(?:\.[0-9]+)?)\s*%\s*이내',
+            r'한도\s*[:：]\s*([0-9]+(?:\.[0-9]+)?)\s*%',
+            r'총액의\s*([0-9]+(?:\.[0-9]+)?)\s*%',
+            r'권면총액의\s*([0-9]+(?:\.[0-9]+)?)\s*%',
+        ]:
+            ratio_m = re.search(ratio_pat, call_section, re.IGNORECASE)
+            if ratio_m:
+                try:
+                    val = float(ratio_m.group(1))
+                    if val <= 100:
+                        ratio = ratio_m.group(1)
+                        break
+                except Exception:
+                    pass
+
+        call_dates = re.findall(r'\d{4}-\d{2}-\d{2}', call_section)
+        call_rows = [
+            (call_dates[i*3], call_dates[i*3+1], call_dates[i*3+2])
+            for i in range(len(call_dates) // 3)
+        ]
+        if call_rows:
+            f, t, _ = find_next_upcoming_row(call_rows)
+            begin, end = f, t
+        else:
+            b_m = re.search(r'(\d{4}년\s*\d{1,2}월\s*\d{1,2}일)부터', call_section)
+            e_m = re.search(r'(\d{4}년\s*\d{1,2}월\s*\d{1,2}일)까지', call_section)
+            if not b_m:
+                range_m = re.search(
+                    r'(\d{4}년\s*\d{1,2}월\s*\d{1,2}일)\s*~\s*(\d{4}년\s*\d{1,2}월\s*\d{1,2}일)',
+                    call_section
+                )
+                if range_m:
+                    begin = parse_korean_date(range_m.group(1))
+                    end   = parse_korean_date(range_m.group(2))
+            if b_m:
+                begin = parse_korean_date(b_m.group(1))
+            if e_m:
+                end = parse_korean_date(e_m.group(1))
+
+        return ytc, ratio, begin, end
+
+    call_found = False
+    for text in texts_primary:
+        call_result = _call(text)
+        if call_result is not None:
+            ytc, ratio, begin, end = call_result
+            result['ytc']        = ytc
+            result['call_ratio'] = ratio
+            result['call_begin'] = begin
+            result['call_end']   = end
+            if ytc:   print(f"    ✅ YTC: {ytc}%")
+            if ratio: print(f"    ✅ CALL비율: {ratio}%")
+            if begin: print(f"    ✅ CALL일정: {begin}~{end}")
+            call_found = True
+            break
+
+    if not call_found:
+        result['call_begin'] = '-'
+        result['call_end']   = '-'
+        result['call_ratio'] = '-'
+        print("    ℹ CALL 없음(-)")
+
     return result
 
 
-# ── 개선 4: xrc_stk_isin 없을 때 ISIN 자체에서 stock_code 추출 시도 ──
-def extract_stock_code_from_isin(isin, corp_name=''):
+# ── EB 발행사 corp_code 조회 ──
+def get_issuer_corp_code(corp_name):
     """
-    xrc_stk_isin이 없는 경우 fallback 전략:
-    1) 채권 ISIN에서 발행사 코드(4~9번째 자리)로 corp_code 검색
-    2) 안 되면 DART 기업명 검색 API 활용
+    EB의 경우 교환 대상 주식코드가 아닌 발행사 기업명으로 corp_code 검색.
+    DART_NAME_DICT(로컬 사전) 우선, 실패 시 API 검색.
     """
-    # 전략 1: ISIN 자체의 6자리 숫자 추출 시도 (KRxxxxxxYYYY 형태)
-    # 채권 ISIN은 주식 코드와 직접 매칭이 안 되므로 이름 기반 검색으로 fallback
-    if not corp_name or corp_name == '-':
-        return ''
-    try:
-        r = requests.get(
-            f"{DART_BASE}/company.json",
-            params={'crtfc_key': DART_KEY, 'corp_name': corp_name},
-            timeout=10
-        )
-        data = r.json()
-        if data.get('status') == '000':
-            items = data.get('list', [])
-            # 상장사(Y) 우선, 그 다음 비상장
-            for item in sorted(items, key=lambda x: 0 if x.get('listed_stock_cnt', '0') != '0' else 1):
-                corp_code = item.get('corp_code', '')
-                if corp_code:
-                    print(f"    📌 corp_code(이름검색): {corp_code} ({corp_name})")
-                    return corp_code
-        print(f"    ⚠ 이름검색 실패: {corp_name}")
-    except Exception as e:
-        print(f"    ⚠ DART 기업검색 실패: {e}")
+    # 정확 매칭
+    for name_try in [corp_name, corp_name.replace('(주)', '').strip(), corp_name.replace('주식회사', '').strip()]:
+        if name_try in DART_NAME_DICT:
+            corp_code = DART_NAME_DICT[name_try]
+            print(f"    📌 발행사 corp_code(이름사전): {corp_code} ({name_try})")
+            return corp_code
+
+    # 부분 매칭
+    matches = [(name, code) for name, code in DART_NAME_DICT.items()
+               if corp_name in name or name in corp_name]
+    if len(matches) == 1:
+        print(f"    📌 발행사 corp_code(부분매칭): {matches[0][1]} ({matches[0][0]})")
+        return matches[0][1]
+    elif len(matches) > 1:
+        best = min(matches, key=lambda x: len(x[0]))
+        print(f"    📌 발행사 corp_code(최단매칭): {best[1]} ({best[0]})")
+        return best[1]
+
+    print(f"    ⚠ 발행사 corp_code 탐색 실패: {corp_name}")
     return ''
 
 
-def parse_dart_for_bond(isin, issu_dt_str, xrc_stk_isin, xrc_price='', corp_name=''):
+def extract_stock_code_from_isin(isin, corp_name=''):
+    """xrc_stk_isin 없을 때 기업명으로 corp_code 검색 (CB/BW용)"""
+    if not corp_name or corp_name == '-':
+        return ''
+    return get_issuer_corp_code(corp_name)
+
+
+def parse_dart_for_bond(isin, issu_dt_str, xrc_stk_isin, xrc_price='', corp_name='', bond_type=''):
     empty = {
         'ytm': '', 'rfxg_floor': '',
         'xrc_begin_dart': '', 'xrc_end_dart': '',
@@ -508,25 +640,31 @@ def parse_dart_for_bond(isin, issu_dt_str, xrc_stk_isin, xrc_price='', corp_name
         return empty
 
     stock_code_6 = xrc_stk_isin[3:9] if xrc_stk_isin and len(xrc_stk_isin) >= 9 else ''
-    print(f"    📎 xrc_stk_isin={xrc_stk_isin} → stock_code_6={stock_code_6}")
+    print(f"    📎 xrc_stk_isin={xrc_stk_isin} → stock_code_6={stock_code_6} / bond_type={bond_type}")
 
     corp_code = ''
-    if stock_code_6:
-        corp_code = dart_get_corp_code(stock_code_6)
 
-    # ── 개선 4: stock_code 없으면 기업명으로 corp_code 검색 ──
-    if not corp_code:
-        print(f"    🔄 기업명 fallback 검색 시도: {corp_name}")
-        corp_code = extract_stock_code_from_isin(isin, corp_name=corp_name)
+    # ── EB: 교환대상 주식코드가 아닌 발행사 corp_code로 검색 ──
+    if bond_type == 'EB':
+        print(f"    🔄 EB → 발행사 기업명으로 corp_code 검색: {corp_name}")
+        corp_code = get_issuer_corp_code(corp_name)
+    else:
+        # CB/BW: 기존 방식 (xrc_stk_isin → stock_code → corp_code)
+        if stock_code_6:
+            corp_code = dart_get_corp_code(stock_code_6)
+        if not corp_code:
+            print(f"    🔄 CB/BW fallback: 기업명으로 corp_code 검색: {corp_name}")
+            corp_code = extract_stock_code_from_isin(isin, corp_name=corp_name)
 
     if not corp_code:
         print(f"    ⚠ corp_code 확보 실패 → DART 스킵")
         return empty
 
-    rcept_no = dart_search_cb_disclosure(corp_code, issu_dt_str)
-    if not rcept_no:
+    correction_no, original_no = dart_search_cb_disclosure(corp_code, issu_dt_str)
+    if not correction_no and not original_no:
         return empty
-    return dart_parse_disclosure(rcept_no, xrc_price=xrc_price)
+
+    return dart_parse_disclosure(correction_no, original_no, xrc_price=xrc_price)
 
 
 # ============================================================
@@ -627,12 +765,14 @@ def get_mezzanine_data(isin, existing_row):
     if basic:
         print(f"→ {basic['corp_name']} {basic['hosu']}회 {basic['bond_type']}")
         corp_name = basic['corp_name']
+        bond_type = basic['bond_type']
         basic_row = [basic['hosu'], basic['bond_type'], basic['issu_dt'], basic['xpir_dt']]
         coupon    = basic['coupon']
         issu_dt   = basic['issu_dt']
     else:
         print("→ ⚠ getBondStatInfo 실패 (기존값 유지)")
         corp_name = existing_row[0].strip() if existing_row else '-'
+        bond_type = existing_row[3].strip() if len(existing_row) > 3 else '-'
         basic_row = [
             existing_row[2].strip() if len(existing_row) > 2 else '-',
             existing_row[3].strip() if len(existing_row) > 3 else '-',
@@ -659,14 +799,14 @@ def get_mezzanine_data(isin, existing_row):
         'ytc': '',
     }
 
-    # ── 개선 4: xrc_stk_isin 없어도 DART 시도 (기업명 fallback) ──
     if API_DART and issu_dt and issu_dt != '-':
         print(f"    🌐 DART 조회 중... (발행일: {issu_dt})")
         dart_data = parse_dart_for_bond(
             isin, issu_dt,
             exercise.get('xrc_stk_isin', ''),
             xrc_price=exercise.get('xrc_price', ''),
-            corp_name=corp_name,   # ← 기업명 전달 추가
+            corp_name=corp_name,
+            bond_type=bond_type,
         )
     else:
         print(f"    ℹ DART 스킵 (issu_dt={issu_dt})")
@@ -747,9 +887,7 @@ async def main():
         results.append((sheet_row, result))
         await asyncio.sleep(1.5)
 
-    # --------------------------------------------------------
-    # 시트 업데이트 (연속 행 배치 업데이트)
-    # --------------------------------------------------------
+    # ── 시트 업데이트 ──
     print("\n📝 시트 업데이트 중...")
     fr = results[0][0]
     lr = results[-1][0]
@@ -799,28 +937,22 @@ async def main():
     print(f"  ✅ T열    YTC       ← DART ({ytc_c}/{len(results)}개)")
     print(f"  ⏳ P열    YTP (추후)")
 
-    # ── 주식코드 시트 업데이트 ──
     await update_stock_code_sheet(data_rows, results)
 
 
 # ============================================================
 # [주식코드 시트 업데이트]
-# 시트명: "주식코드"
-# 컬럼: A 종목명 | B 채권ISIN | C 종류 | D 발행사 주식코드 | E 교환대상 주식코드
 # ============================================================
 async def update_stock_code_sheet(data_rows, results):
     print("\n📊 주식코드 시트 업데이트 중...")
 
     STOCK_SHEET_NAME = '주식코드'
-
-    # 시트 가져오기 or 생성
     try:
         ws_stock = sh.worksheet(STOCK_SHEET_NAME)
     except Exception:
         ws_stock = sh.add_worksheet(title=STOCK_SHEET_NAME, rows=200, cols=6)
         print(f"  ✅ '{STOCK_SHEET_NAME}' 시트 새로 생성")
 
-    # 헤더
     headers = ['종목명', '채권ISIN', '종류', '발행사 주식코드', '교환대상 주식코드']
     ws_stock.update([headers], range_name='A1:E1')
     ws_stock.format('A1:E1', {
@@ -830,14 +962,12 @@ async def update_stock_code_sheet(data_rows, results):
     })
     await asyncio.sleep(1.0)
 
-    # 데이터: 종목별 주식코드 수집
     rows = []
     for (sheet_row, row), (_, result) in zip(data_rows, results):
         isin      = row[1].strip()
         bond_type = result['basic_row'][1] if result['basic_row'] else row[3].strip()
         name      = result['corp_name']
 
-        # xrc_stk_isin → 주식코드 6자리
         xrc_stk_isin = ''
         stock_code   = ''
         try:
@@ -848,10 +978,8 @@ async def update_stock_code_sheet(data_rows, results):
         except Exception:
             pass
 
-        # CB/BW: 발행사=교환대상 동일
-        # EB: 발행사 ≠ 교환대상 (교환대상이 xrc_stk_isin)
         if bond_type == 'EB':
-            issuer_code = ''        # EB는 발행사 주식코드 별도 조회 필요
+            issuer_code = ''
             target_code = stock_code
         else:
             issuer_code = stock_code
@@ -861,7 +989,6 @@ async def update_stock_code_sheet(data_rows, results):
         await asyncio.sleep(0.3)
 
     if rows:
-        # 기존 데이터 클리어 후 재기록
         ws_stock.batch_clear([f'A2:E{len(rows)+10}'])
         await asyncio.sleep(1.0)
         ws_stock.update(rows, range_name=f'A2:E{len(rows)+1}')
