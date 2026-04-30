@@ -59,11 +59,12 @@ DART_BASE   = "https://opendart.fss.or.kr/api"
 # ============================================================
 # [DART 기업코드 딕셔너리]
 # ============================================================
-DART_CORP_DICT = {}
-DART_NAME_DICT = {}  # 기업명 → corp_code (전체, 비상장 포함)
+DART_CORP_DICT      = {}   # stock_code → corp_code
+DART_CORP_NAME_DICT = {}   # stock_code → corp_name
+DART_NAME_DICT      = {}   # name → corp_code (fallback용)
 
 def load_dart_corp_codes():
-    global DART_CORP_DICT, DART_NAME_DICT
+    global DART_CORP_DICT, DART_CORP_NAME_DICT, DART_NAME_DICT
     try:
         print("  📥 DART 기업코드 전체 다운로드 중...")
         r = requests.get(f"{DART_BASE}/corpCode.xml", params={'crtfc_key': DART_KEY}, timeout=30)
@@ -76,13 +77,46 @@ def load_dart_corp_codes():
             stock_code = item.findtext('stock_code', '').strip()
             corp_name  = item.findtext('corp_name', '').strip()
             if stock_code and len(stock_code) == 6:
-                DART_CORP_DICT[stock_code] = corp_code
+                DART_CORP_DICT[stock_code]      = corp_code
+                DART_CORP_NAME_DICT[stock_code] = corp_name
                 count += 1
             if corp_name and corp_code:
                 DART_NAME_DICT[corp_name] = corp_code
         print(f"  ✅ DART 기업코드 로드 완료: {count:,}개 (상장사), 이름사전 {len(DART_NAME_DICT):,}개")
     except Exception as e:
         print(f"  ⚠ DART 기업코드 로드 실패: {e}")
+
+
+# ============================================================
+# [ISIN → 발행사 주식코드 변환]
+# 한국 채권 ISIN 규칙: KR6 + 발행사주식코드 + 회차/리비전 코드
+# 채권 발행사 코드 = 주식코드의 마지막 자리 +1
+# 예: 주식 001080 → 채권 001081
+# ============================================================
+def isin_to_issuer_stock_code(isin):
+    """
+    채권 ISIN에서 발행사 주식코드 추출.
+    KR6XXXXXXAAAA 형식에서 XXXXXX의 마지막 자리 -1
+    """
+    if not isin or len(isin) < 9 or not isin.startswith('KR6'):
+        return ''
+    bond_code = isin[3:9]  # 4~9번째 자리
+    if not bond_code.isdigit():
+        return ''
+    try:
+        # 마지막 자리 -1
+        stock_num = int(bond_code) - 1
+        return f"{stock_num:06d}"
+    except Exception:
+        return ''
+
+
+def stock_isin_to_code(stock_isin):
+    """주식 ISIN(KR7xxxxxxxxxx)에서 6자리 주식코드 추출"""
+    if not stock_isin or len(stock_isin) < 9:
+        return ''
+    code = stock_isin[3:9]
+    return code if code.isdigit() else ''
 
 
 # ============================================================
@@ -182,13 +216,6 @@ def extract_hosu(nm):
     return '-'
 
 
-def extract_corp_name(nm):
-    m = re.match(r'([가-힣a-zA-Z\s]+?)\s*\d+\s*(?:CB|EB|BW)', nm or '')
-    if m:
-        return m.group(1).strip()
-    return nm.split('(')[0].strip() if nm else '-'
-
-
 def determine_bond_type(secn_nm):
     nm = secn_nm or ''
     if 'EB' in nm or '교환' in nm:
@@ -203,21 +230,17 @@ def determine_bond_type(secn_nm):
 # ============================================================
 # [DART 파싱]
 # ============================================================
-def dart_get_corp_code(stock_code_6):
-    corp_code = DART_CORP_DICT.get(stock_code_6, '')
-    if corp_code:
-        print(f"    📌 corp_code: {corp_code} (stock: {stock_code_6})")
-    else:
-        print(f"    ⚠ corp_code 없음 (stock: {stock_code_6})")
-    return corp_code
+def get_dart_info_by_stock_code(stock_code):
+    """주식코드 → (corp_code, corp_name) 반환"""
+    corp_code = DART_CORP_DICT.get(stock_code, '')
+    corp_name = DART_CORP_NAME_DICT.get(stock_code, '')
+    return corp_code, corp_name
 
 
 def dart_search_cb_disclosure(corp_code, issu_dt_str):
     """
-    발행일 기준 -90일 ~ +30일로 범위 검색.
-    [기재정정] 우선 수용, [첨부정정] 스킵, [첨부추가] 수용.
-    B타입 실패 시 전체타입 재검색.
-    반환값: (기재정정_rcept_no, 원본_rcept_no) 튜플
+    발행일 기준 -90일 ~ +30일 범위 검색.
+    반환값: (기재정정_rcept_no, 원본_rcept_no)
     """
     try:
         issu_date = datetime.strptime(issu_dt_str, '%Y-%m-%d')
@@ -226,10 +249,6 @@ def dart_search_cb_disclosure(corp_code, issu_dt_str):
 
         issue_kws = [
             '전환사채권발행결정', '교환사채권발행결정', '신주인수권부사채권발행결정',
-        ]
-        correction_kws = [
-            '[기재정정]전환사채권발행결정', '[기재정정]교환사채권발행결정',
-            '[기재정정]신주인수권부사채권발행결정',
         ]
 
         for pblntf_ty in ['B', '']:
@@ -255,31 +274,27 @@ def dart_search_cb_disclosure(corp_code, issu_dt_str):
             original_no   = ''
 
             for item in items:
-                rpt = item.get('report_nm', '')
+                rpt      = item.get('report_nm', '')
                 rcept_no = item.get('rcept_no', '')
 
-                # [첨부정정]은 본문 없는 껍데기 → 스킵
                 if '[첨부정정]' in rpt:
                     print(f"    ⏭ 첨부정정 스킵: {rpt}")
                     continue
 
-                # [첨부추가]는 수용 (한진 케이스)
-                # [기재정정] 우선 저장
-                if any(kw in rpt for kw in correction_kws):
+                # [기재정정] 먼저 체크
+                if '[기재정정]' in rpt and any(kw in rpt for kw in issue_kws):
                     if not correction_no:
                         correction_no = rcept_no
                         print(f"    📄 기재정정 발견: {rpt} ({rcept_no})")
 
-                # 원본 발행결정 저장
-                elif any(kw in rpt for kw in issue_kws):
+                # 순수 원본
+                elif '[기재정정]' not in rpt and '[첨부추가]' not in rpt and any(kw in rpt for kw in issue_kws):
                     if not original_no:
                         original_no = rcept_no
                         print(f"    📄 원본 발견: {rpt} ({rcept_no})")
 
-                # [첨부추가] 케이스 - 원본으로 취급
-                elif '[첨부추가]' in rpt and any(kw in rpt for kw in [
-                    '전환사채권발행결정', '교환사채권발행결정', '신주인수권부사채권발행결정'
-                ]):
+                # [첨부추가] 원본으로 취급
+                elif '[첨부추가]' in rpt and any(kw in rpt for kw in issue_kws):
                     if not original_no:
                         original_no = rcept_no
                         print(f"    📄 첨부추가 발견: {rpt} ({rcept_no})")
@@ -294,7 +309,6 @@ def dart_search_cb_disclosure(corp_code, issu_dt_str):
 
 
 def _parse_document_text(rcept_no):
-    """공시 본문을 받아 clean text로 반환"""
     try:
         r = requests.get(
             f"{DART_BASE}/document.xml",
@@ -324,12 +338,6 @@ def _parse_document_text(rcept_no):
 
 
 def dart_parse_disclosure(correction_rcept_no, original_rcept_no, xrc_price=''):
-    """
-    기재정정 공시와 원본 공시를 모두 파싱.
-    - 전환청구 시작일: 원본 공시에서 우선 파싱
-    - 전환청구 종료일: 기재정정 공시에서 우선 파싱 (변경된 값)
-    - 나머지: 기재정정 → 원본 순서로 파싱
-    """
     result = {
         'ytm': '', 'rfxg_floor': '',
         'xrc_begin_dart': '', 'xrc_end_dart': '',
@@ -338,16 +346,13 @@ def dart_parse_disclosure(correction_rcept_no, original_rcept_no, xrc_price=''):
         'ytc': '',
     }
 
-    # 텍스트 로드 (기재정정 + 원본)
     correction_text = _parse_document_text(correction_rcept_no) if correction_rcept_no else ''
     original_text   = _parse_document_text(original_rcept_no)   if original_rcept_no   else ''
 
     print(f"    🌐 document API: 기재정정={bool(correction_text)}, 원본={bool(original_text)}")
 
-    # 파싱은 원본 우선 → 기재정정으로 보완하는 텍스트 리스트
-    # (전환청구 시작일은 원본에 있고, 종료일은 기재정정에서 바뀔 수 있음)
-    texts_primary   = [t for t in [original_text, correction_text] if t]   # 원본 우선
-    texts_correction = [t for t in [correction_text, original_text] if t]  # 기재정정 우선
+    texts_primary    = [t for t in [original_text, correction_text] if t]
+    texts_correction = [t for t in [correction_text, original_text] if t]
 
     def parse_from_texts(texts, parse_fn):
         for text in texts:
@@ -356,7 +361,7 @@ def dart_parse_disclosure(correction_rcept_no, original_rcept_no, xrc_price=''):
                 return val
         return ''
 
-    # ── YTM ──
+    # YTM
     def _ytm(clean):
         for pat in [
             r'만기이자율[^0-9\n]*([0-9]+(?:\.[0-9]+)?)',
@@ -381,7 +386,7 @@ def dart_parse_disclosure(correction_rcept_no, original_rcept_no, xrc_price=''):
     if result['ytm']:
         print(f"    ✅ YTM: {result['ytm']}%")
 
-    # ── 리픽싱플로어 ──
+    # 리픽싱플로어
     def _rfxg(clean):
         m = re.search(r'최저\s*(?:조정|전환|행사)\s*가액[^0-9\n]*?(-|–|[0-9][0-9,]+)', clean)
         if m:
@@ -404,11 +409,13 @@ def dart_parse_disclosure(correction_rcept_no, original_rcept_no, xrc_price=''):
     elif result['rfxg_floor']:
         print(f"    ✅ 리픽싱플로어: {result['rfxg_floor']}")
 
-    # ── 전환청구기간 ──
-    # 시작일: 원본 우선, 종료일: 기재정정 우선
+    # 전환청구기간
     def _xrc_dates(clean):
         begin, end = '', ''
-        for kw in ['전환청구기간', '교환청구기간', '행사청구기간', '권리행사기간', '전환권 행사', '전환권행사']:
+        for kw in [
+            '전환청구기간', '교환청구기간', '행사청구기간',
+            '권리행사기간', '전환권 행사', '전환권행사',
+        ]:
             idx = clean.find(kw)
             if idx < 0:
                 continue
@@ -429,7 +436,6 @@ def dart_parse_disclosure(correction_rcept_no, original_rcept_no, xrc_price=''):
                 re.search(r'까지[^0-9\n]*(\d{4}년\s*\d{1,2}월\s*\d{1,2}일)', section)
             )
 
-            # ~ 범위 패턴
             if not m_b and not m_e:
                 range_m = re.search(
                     r'(\d{4}년\s*\d{1,2}월\s*\d{1,2}일|\d{4}-\d{2}-\d{2}|\d{4}\.\d{2}\.\d{2})'
@@ -450,13 +456,11 @@ def dart_parse_disclosure(correction_rcept_no, original_rcept_no, xrc_price=''):
                 break
         return begin, end
 
-    # 시작일: 원본 우선
     for text in texts_primary:
         b, e = _xrc_dates(text)
         if b:
             result['xrc_begin_dart'] = b
             break
-    # 종료일: 기재정정 우선 (정정된 값 반영)
     for text in texts_correction:
         b, e = _xrc_dates(text)
         if e:
@@ -468,7 +472,7 @@ def dart_parse_disclosure(correction_rcept_no, original_rcept_no, xrc_price=''):
     if result['xrc_end_dart']:
         print(f"    ✅ 전환청구종료: {result['xrc_end_dart']}")
 
-    # ── PUT ──
+    # PUT
     def _put(clean):
         put_idx = -1
         for kw in ['조기상환 청구기간', '조기상환청구기간', '[조기상환청구권', '조기상환청구권(Put']:
@@ -479,11 +483,15 @@ def dart_parse_disclosure(correction_rcept_no, original_rcept_no, xrc_price=''):
         if put_idx >= 0:
             put_section = clean[put_idx: put_idx + 5000]
             dates = re.findall(r'\d{4}-\d{2}-\d{2}', put_section)
-            rows = [(dates[i*3], dates[i*3+1], dates[i*3+2]) for i in range(len(dates) // 3)]
+            rows = [
+                (dates[i*3], dates[i*3+1], dates[i*3+2])
+                for i in range(len(dates) // 3)
+            ]
             if rows:
                 return find_next_upcoming_row(rows)
         return None
 
+    put_found = False
     for text in texts_primary:
         put_result = _put(text)
         if put_result is not None:
@@ -492,14 +500,16 @@ def dart_parse_disclosure(correction_rcept_no, original_rcept_no, xrc_price=''):
             result['put_end']   = t
             result['put_date']  = p
             print(f"    ✅ PUT: {f}~{t}, 상환: {p}")
+            put_found = True
             break
-    else:
+
+    if not put_found:
         result['put_begin'] = '-'
         result['put_end']   = '-'
         result['put_date']  = '-'
         print("    ℹ PUT 없음(-)")
 
-    # ── CALL ──
+    # CALL
     def _call(clean):
         call_idx = -1
         for kw in [
@@ -593,42 +603,7 @@ def dart_parse_disclosure(correction_rcept_no, original_rcept_no, xrc_price=''):
     return result
 
 
-# ── EB 발행사 corp_code 조회 ──
-def get_issuer_corp_code(corp_name):
-    """
-    EB의 경우 교환 대상 주식코드가 아닌 발행사 기업명으로 corp_code 검색.
-    DART_NAME_DICT(로컬 사전) 우선, 실패 시 API 검색.
-    """
-    # 정확 매칭
-    for name_try in [corp_name, corp_name.replace('(주)', '').strip(), corp_name.replace('주식회사', '').strip()]:
-        if name_try in DART_NAME_DICT:
-            corp_code = DART_NAME_DICT[name_try]
-            print(f"    📌 발행사 corp_code(이름사전): {corp_code} ({name_try})")
-            return corp_code
-
-    # 부분 매칭
-    matches = [(name, code) for name, code in DART_NAME_DICT.items()
-               if corp_name in name or name in corp_name]
-    if len(matches) == 1:
-        print(f"    📌 발행사 corp_code(부분매칭): {matches[0][1]} ({matches[0][0]})")
-        return matches[0][1]
-    elif len(matches) > 1:
-        best = min(matches, key=lambda x: len(x[0]))
-        print(f"    📌 발행사 corp_code(최단매칭): {best[1]} ({best[0]})")
-        return best[1]
-
-    print(f"    ⚠ 발행사 corp_code 탐색 실패: {corp_name}")
-    return ''
-
-
-def extract_stock_code_from_isin(isin, corp_name=''):
-    """xrc_stk_isin 없을 때 기업명으로 corp_code 검색 (CB/BW용)"""
-    if not corp_name or corp_name == '-':
-        return ''
-    return get_issuer_corp_code(corp_name)
-
-
-def parse_dart_for_bond(isin, issu_dt_str, xrc_stk_isin, xrc_price='', corp_name='', bond_type=''):
+def parse_dart_for_bond(issuer_corp_code, issu_dt_str, xrc_price=''):
     empty = {
         'ytm': '', 'rfxg_floor': '',
         'xrc_begin_dart': '', 'xrc_end_dart': '',
@@ -636,31 +611,10 @@ def parse_dart_for_bond(isin, issu_dt_str, xrc_stk_isin, xrc_price='', corp_name
         'call_ratio': '', 'call_begin': '', 'call_end': '',
         'ytc': '',
     }
-    if not API_DART:
+    if not API_DART or not issuer_corp_code:
         return empty
 
-    stock_code_6 = xrc_stk_isin[3:9] if xrc_stk_isin and len(xrc_stk_isin) >= 9 else ''
-    print(f"    📎 xrc_stk_isin={xrc_stk_isin} → stock_code_6={stock_code_6} / bond_type={bond_type}")
-
-    corp_code = ''
-
-    # ── EB: 교환대상 주식코드가 아닌 발행사 corp_code로 검색 ──
-    if bond_type == 'EB':
-        print(f"    🔄 EB → 발행사 기업명으로 corp_code 검색: {corp_name}")
-        corp_code = get_issuer_corp_code(corp_name)
-    else:
-        # CB/BW: 기존 방식 (xrc_stk_isin → stock_code → corp_code)
-        if stock_code_6:
-            corp_code = dart_get_corp_code(stock_code_6)
-        if not corp_code:
-            print(f"    🔄 CB/BW fallback: 기업명으로 corp_code 검색: {corp_name}")
-            corp_code = extract_stock_code_from_isin(isin, corp_name=corp_name)
-
-    if not corp_code:
-        print(f"    ⚠ corp_code 확보 실패 → DART 스킵")
-        return empty
-
-    correction_no, original_no = dart_search_cb_disclosure(corp_code, issu_dt_str)
+    correction_no, original_no = dart_search_cb_disclosure(issuer_corp_code, issu_dt_str)
     if not correction_no and not original_no:
         return empty
 
@@ -679,7 +633,7 @@ def parse_bond_basic(isin):
         return None
     secn_nm = get_attr(el, 'KOR_SECN_NM')
     return {
-        'corp_name': extract_corp_name(secn_nm),
+        'secn_nm':   secn_nm,
         'hosu':      extract_hosu(secn_nm),
         'bond_type': determine_bond_type(secn_nm),
         'issu_dt':   format_date(get_attr(el, 'ISSU_DT')),
@@ -712,13 +666,18 @@ def parse_put_call_seibro(isin):
 
 
 def parse_exercise_info(isin):
-    r = {'xrc_price': '', 'xrc_begin': '', 'xrc_end': '', 'xrc_stk_isin': ''}
+    """SEIBRO에서 행사가, 교환대상 주식 정보 추출"""
+    r = {
+        'xrc_price': '', 'xrc_begin': '', 'xrc_end': '',
+        'xrc_stk_isin': '', 'xrc_stk_name': '',
+    }
     root = seibro_api('getXrcStkStatInfo', {'BOND_ISIN': isin})
     if root is not None:
         el = root.find('.//result')
         if el is not None:
             r['xrc_price']    = fmt_number(get_attr(el, 'XRC_PRICE'))
             r['xrc_stk_isin'] = get_attr(el, 'XRC_STK_ISIN')
+            r['xrc_stk_name'] = get_attr(el, 'STK_SECN_NM')   # SEIBRO 표시 종목명
     root2 = seibro_api('getXrcStkOptionXrcInfo', {'BOND_ISIN': isin})
     if root2 is not None:
         begins, ends = [], []
@@ -761,17 +720,38 @@ def debug_raw_xml(isin):
 def get_mezzanine_data(isin, existing_row):
     print(f"  🔍 {isin}", end=' ')
 
+    # ── SEIBRO 기본정보 ──
     basic = parse_bond_basic(isin)
+
+    # ── ISIN 기반 발행사 주식코드 추출 ──
+    issuer_stock_code = isin_to_issuer_stock_code(isin)
+    issuer_corp_code  = ''
+    issuer_corp_name  = ''
+
+    if issuer_stock_code:
+        issuer_corp_code, issuer_corp_name = get_dart_info_by_stock_code(issuer_stock_code)
+        if issuer_corp_code:
+            print(f" [발행사: {issuer_corp_name} / 주식코드: {issuer_stock_code}]")
+        else:
+            print(f" [발행사 stock_code={issuer_stock_code}, DART 매칭 실패]")
+    else:
+        print(" [발행사 stock_code 추출 실패]")
+
     if basic:
-        print(f"→ {basic['corp_name']} {basic['hosu']}회 {basic['bond_type']}")
-        corp_name = basic['corp_name']
         bond_type = basic['bond_type']
+        # 종목명: DART 등록명 우선, 없으면 SEIBRO 추출명
+        if issuer_corp_name:
+            corp_name = issuer_corp_name
+        else:
+            corp_name = re.match(r'([가-힣a-zA-Z\s]+?)\s*\d+\s*(?:CB|EB|BW)', basic['secn_nm'])
+            corp_name = corp_name.group(1).strip() if corp_name else (basic['secn_nm'].split('(')[0].strip())
         basic_row = [basic['hosu'], basic['bond_type'], basic['issu_dt'], basic['xpir_dt']]
         coupon    = basic['coupon']
         issu_dt   = basic['issu_dt']
+        print(f"    → {corp_name} {basic['hosu']}회 {basic['bond_type']}")
     else:
-        print("→ ⚠ getBondStatInfo 실패 (기존값 유지)")
-        corp_name = existing_row[0].strip() if existing_row else '-'
+        print(" → ⚠ getBondStatInfo 실패 (기존값 유지)")
+        corp_name = issuer_corp_name or (existing_row[0].strip() if existing_row else '-')
         bond_type = existing_row[3].strip() if len(existing_row) > 3 else '-'
         basic_row = [
             existing_row[2].strip() if len(existing_row) > 2 else '-',
@@ -783,8 +763,20 @@ def get_mezzanine_data(isin, existing_row):
         issu_dt = existing_row[4].strip() if len(existing_row) > 4 else ''
 
     exercise = parse_exercise_info(isin) if API_STOCK_APPROVED else {
-        'xrc_price': '', 'xrc_begin': '', 'xrc_end': '', 'xrc_stk_isin': '',
+        'xrc_price': '', 'xrc_begin': '', 'xrc_end': '',
+        'xrc_stk_isin': '', 'xrc_stk_name': '',
     }
+
+    # ── 교환대상 정보 (EB만) ──
+    target_stock_code = ''
+    target_corp_name  = ''
+    if bond_type == 'EB' and exercise.get('xrc_stk_isin'):
+        target_stock_code = stock_isin_to_code(exercise['xrc_stk_isin'])
+        if target_stock_code:
+            _, target_corp_name = get_dart_info_by_stock_code(target_stock_code)
+            if not target_corp_name:
+                target_corp_name = exercise.get('xrc_stk_name', '')
+            print(f"    🎯 교환대상: {target_corp_name} ({target_stock_code})")
 
     seibro_pc = parse_put_call_seibro(isin) if API_BOND_APPROVED else {
         'put_begin': '', 'put_end': '', 'put_date': '',
@@ -799,17 +791,14 @@ def get_mezzanine_data(isin, existing_row):
         'ytc': '',
     }
 
-    if API_DART and issu_dt and issu_dt != '-':
-        print(f"    🌐 DART 조회 중... (발행일: {issu_dt})")
+    if API_DART and issu_dt and issu_dt != '-' and issuer_corp_code:
+        print(f"    🌐 DART 조회 중... (발행일: {issu_dt}, corp_code: {issuer_corp_code})")
         dart_data = parse_dart_for_bond(
-            isin, issu_dt,
-            exercise.get('xrc_stk_isin', ''),
+            issuer_corp_code, issu_dt,
             xrc_price=exercise.get('xrc_price', ''),
-            corp_name=corp_name,
-            bond_type=bond_type,
         )
     else:
-        print(f"    ℹ DART 스킵 (issu_dt={issu_dt})")
+        print(f"    ℹ DART 스킵 (issu_dt={issu_dt}, corp_code={issuer_corp_code})")
 
     final_xrc_begin = dart_data.get('xrc_begin_dart') or exercise['xrc_begin']
     final_xrc_end   = dart_data.get('xrc_end_dart')   or exercise['xrc_end']
@@ -833,17 +822,20 @@ def get_mezzanine_data(isin, existing_row):
         }
 
     return {
-        'corp_name':  corp_name,
-        'basic_row':  basic_row,
-        'coupon':     coupon,
-        'ytm':        dart_data['ytm'],
-        'xrc_price':  exercise.get('xrc_price', ''),
-        'rfxg_floor': dart_data['rfxg_floor'],
-        'xrc_begin':  final_xrc_begin,
-        'xrc_end':    final_xrc_end,
-        'put':        final_put,
-        'call':       final_call,
-        'ytc':        dart_data.get('ytc', ''),
+        'corp_name':         corp_name,
+        'basic_row':         basic_row,
+        'coupon':            coupon,
+        'ytm':               dart_data['ytm'],
+        'xrc_price':         exercise.get('xrc_price', ''),
+        'rfxg_floor':        dart_data['rfxg_floor'],
+        'xrc_begin':         final_xrc_begin,
+        'xrc_end':           final_xrc_end,
+        'put':               final_put,
+        'call':              final_call,
+        'ytc':               dart_data.get('ytc', ''),
+        'issuer_stock_code': issuer_stock_code,
+        'target_corp_name':  target_corp_name,
+        'target_stock_code': target_stock_code,
     }
 
 
@@ -865,6 +857,20 @@ async def main():
 
     print("📋 스프레드시트 읽는 중...")
     all_values = worksheet.get_all_values()
+
+    # 헤더 업데이트 (U, V, W 컬럼 추가)
+    print("📋 헤더 업데이트 중 (U/V/W 컬럼 추가)...")
+    worksheet.update(
+        [['발행사 주식코드', '교환대상 회사명', '교환대상 주식코드']],
+        range_name='U1:W1'
+    )
+    worksheet.format('U1:W1', {
+        'textFormat': {'bold': True},
+        'backgroundColor': {'red': 0.2, 'green': 0.5, 'blue': 0.3},
+        'horizontalAlignment': 'CENTER',
+    })
+    await asyncio.sleep(1.0)
+
     data_rows = [
         (i + 2, row)
         for i, row in enumerate(all_values[1:])
@@ -915,17 +921,22 @@ async def main():
     await asyncio.sleep(1.0)
     upd(f"T{fr}:T{lr}",  [[r['ytc']]        for _, r in results])
     await asyncio.sleep(1.0)
+    # ── U, V, W 컬럼 업데이트 ──
+    upd(f"U{fr}:W{lr}",  [[r['issuer_stock_code'], r['target_corp_name'], r['target_stock_code']] for _, r in results])
+    await asyncio.sleep(1.0)
 
-    ytm_c  = sum(1 for _, r in results if r['ytm'])
-    rfxg_c = sum(1 for _, r in results if r['rfxg_floor'])
-    put_c  = sum(1 for _, r in results if r['put']['put_begin'] not in ('', '-'))
-    call_c = sum(1 for _, r in results if r['call']['call_ratio'] not in ('', '-'))
-    ytc_c  = sum(1 for _, r in results if r['ytc'])
+    ytm_c    = sum(1 for _, r in results if r['ytm'])
+    rfxg_c   = sum(1 for _, r in results if r['rfxg_floor'])
+    put_c    = sum(1 for _, r in results if r['put']['put_begin'] not in ('', '-'))
+    call_c   = sum(1 for _, r in results if r['call']['call_ratio'] not in ('', '-'))
+    ytc_c    = sum(1 for _, r in results if r['ytc'])
+    issuer_c = sum(1 for _, r in results if r['issuer_stock_code'])
+    target_c = sum(1 for _, r in results if r['target_corp_name'])
 
     print(f"\n🏁 완료! {len(results)}개 종목 업데이트됨")
     print(f"👉 https://docs.google.com/spreadsheets/d/{SHEET_ID}")
     print(f"\n📌 업데이트 현황:")
-    print(f"  ✅ A열    종목명")
+    print(f"  ✅ A열    종목명     ← DART 등록명")
     print(f"  ✅ C~F열  회차·종류·발행일·만기일")
     print(f"  ✅ G열    Coupon")
     print(f"  ✅ H열    YTM       ← DART ({ytm_c}/{len(results)}개)")
@@ -935,6 +946,9 @@ async def main():
     print(f"  ✅ M~O열  PUT       ← DART ({put_c}/{len(results)}개, 없으면 -)")
     print(f"  ✅ Q~S열  CALL      ← DART ({call_c}/{len(results)}개, 없으면 -)")
     print(f"  ✅ T열    YTC       ← DART ({ytc_c}/{len(results)}개)")
+    print(f"  ✅ U열    발행사 주식코드 ({issuer_c}/{len(results)}개)")
+    print(f"  ✅ V열    교환대상 회사명 ({target_c}/{len(results)}개, EB만)")
+    print(f"  ✅ W열    교환대상 주식코드")
     print(f"  ⏳ P열    YTP (추후)")
 
     await update_stock_code_sheet(data_rows, results)
@@ -968,25 +982,10 @@ async def update_stock_code_sheet(data_rows, results):
         bond_type = result['basic_row'][1] if result['basic_row'] else row[3].strip()
         name      = result['corp_name']
 
-        xrc_stk_isin = ''
-        stock_code   = ''
-        try:
-            ex = parse_exercise_info(isin)
-            xrc_stk_isin = ex.get('xrc_stk_isin', '')
-            if xrc_stk_isin and len(xrc_stk_isin) >= 9:
-                stock_code = xrc_stk_isin[3:9]
-        except Exception:
-            pass
-
-        if bond_type == 'EB':
-            issuer_code = ''
-            target_code = stock_code
-        else:
-            issuer_code = stock_code
-            target_code = stock_code
+        issuer_code = result.get('issuer_stock_code', '')
+        target_code = result.get('target_stock_code', '') or issuer_code
 
         rows.append([name, isin, bond_type, issuer_code, target_code])
-        await asyncio.sleep(0.3)
 
     if rows:
         ws_stock.batch_clear([f'A2:E{len(rows)+10}'])
