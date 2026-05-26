@@ -1,0 +1,29 @@
+name: Bulk Match ISINs
+
+on:
+  workflow_dispatch:
+
+jobs:
+  match:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install requests gspread google-auth
+      
+      - name: Run bulk matching
+        env:
+          SEIBRO_KEY: ${{ secrets.SEIBRO_KEY }}
+          DART_API_KEY: ${{ secrets.DART_API_KEY }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/bulk_match.py
