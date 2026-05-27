@@ -1,0 +1,32 @@
+name: Monthly Recheck
+
+on:
+  schedule:
+    # 매월 1일 KST 9시 = UTC 0시
+    - cron: '0 0 1 * *'
+  workflow_dispatch:  # 수동 실행도 가능
+
+jobs:
+  recheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install requests gspread google-auth
+
+      - name: Run monthly recheck
+        env:
+          SEIBRO_KEY: ${{ secrets.SEIBRO_KEY }}
+          DART_API_KEY: ${{ secrets.DART_API_KEY }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/monthly_recheck.py
