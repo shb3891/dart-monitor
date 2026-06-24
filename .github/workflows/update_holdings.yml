@@ -1,0 +1,43 @@
+name: Update Holdings
+
+# 보유내역 자동 업데이트
+# - holdings/ 폴더에 새 xlsx 파일이 push되면 자동 실행
+# - 수동 실행도 가능
+on:
+  push:
+    paths:
+      - 'holdings/**.xlsx'
+      - 'holdings/**.xls'
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install gspread google-auth requests python-dateutil pandas openpyxl
+          fi
+      
+      - name: Run Holdings Update
+        env:
+          GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+        run: python update_holdings.py
