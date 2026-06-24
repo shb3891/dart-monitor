@@ -1,0 +1,51 @@
+name: Hourly Dart Monitor
+
+# main.py 실행: 시트 자동 갱신 + 자본변동 감지
+# - 평일 장중 (KST 09:00~16:00): 10분마다
+# - 평일 장외 + 주말: 1시간마다
+on:
+  schedule:
+    # 평일 장중 (KST 09:00~16:00 = UTC 00:00~07:00) 10분마다
+    - cron: '*/10 0-6 * * 1-5'
+    # 평일 장외 (KST 17:00~다음날 08:00 = UTC 08:00~23:00) 1시간마다
+    - cron: '0 8-23 * * 1-5'
+    # 주말 1시간마다
+    - cron: '0 * * * 0,6'
+  workflow_dispatch:  # 수동 실행 가능
+
+# 동시 실행 방지 (이전 실행이 끝나기 전 새로 시작 X)
+concurrency:
+  group: hourly-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50  # 최대 50분 (1시간 안 넘게)
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install gspread google-auth requests python-dateutil
+          fi
+      
+      - name: Run Main Monitor
+        env:
+          GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+          DART_API_KEY: ${{ secrets.DART_API_KEY }}
+          SEIBRO_KEY: ${{ secrets.SEIBRO_KEY }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+        run: python main.py
