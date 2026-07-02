@@ -1,9 +1,12 @@
 """
-dart-monitor main.py (v2.0)
-- 기존 기능: 시트1 자동 갱신 (113개 종목)
-- NEW: 새 풋콜스케줄 시트 자동 갱신 (6종 이벤트)
-- NEW: 자본변동 감지 (액면병합/분할/무상증자)
-- NEW: 신규 메자닌 발행 자동 감지
+dart-monitor main.py (v2.1)
+- 기존 기능: 시트1 자동 갱신 (133개 종목, 자동 확장)
+- 풋콜스케줄 시트 자동 갱신 (6종 이벤트)
+- 자본변동 감지 (액면병합/분할/무상증자)
+- 신규 메자닌 발행 자동 감지
+- v2.1 FIX: PUT/CALL 스케줄 파싱을 차수(N차) 기반으로 재작성
+  → 이전: 날짜 3개씩 순서로 묶어서 차수 부여 (뒤죽박죽)
+  → 지금: PDF 표에서 "N차 FROM TO 지급일" 패턴 직접 매칭
 """
 
 import asyncio
@@ -649,9 +652,9 @@ def dart_parse_disclosure(correction_rcept_no, original_rcept_no, xrc_price=''):
     if result['xrc_end_dart']:
         print(f"  ✅ 전환청구종료: {result['xrc_end_dart']}")
 
-    # PUT (전체 스케줄 추출)
+    # PUT (전체 스케줄 추출) - 표에서 "N차" 패턴 기반으로 추출
     def _put_all(clean):
-        """모든 PUT 차수 추출"""
+        """모든 PUT 차수 추출 - 차수 번호 기반 파싱"""
         put_idx = -1
         for kw in ['조기상환 청구기간', '조기상환청구기간', '[조기상환청구권', '조기상환청구권(Put']:
             idx = clean.find(kw)
@@ -661,19 +664,65 @@ def dart_parse_disclosure(correction_rcept_no, original_rcept_no, xrc_price=''):
         if put_idx < 0:
             return []
         
-        put_section = clean[put_idx: put_idx + 5000]
-        dates = re.findall(r'\d{4}-\d{2}-\d{2}', put_section)
-        rates = re.findall(r'(\d{2,3}\.\d{2,6})\s*%', put_section)
+        # PUT 섹션 끝 지점 찾기
+        end_markers = [
+            '매도청구권(Call', '매도청구권(call', '[매도청구권',
+            '매도 청구권', '매수청구권',
+            'Call Option', 'call option',
+            '주식으로의 전환청구', '전환에 관한 사항',
+            '가) 사채의 종류', '나) 사채의 종류',
+            '기타 투자판단', '기타 특약사항', '기타사항',
+            '제6조', '제7조',
+        ]
+        put_end = put_idx + 8000
+        for marker in end_markers:
+            m_idx = clean.find(marker, put_idx + 100)
+            if m_idx > 0 and m_idx < put_end:
+                put_end = m_idx
+        
+        put_section = clean[put_idx: put_end]
+        
+        # 차수 기반 파싱: "N차 YYYY-MM-DD YYYY-MM-DD YYYY-MM-DD [비율]"
+        # 예: "1차\t2028-04-30\t2028-05-30\t2028-06-29\t100.0000"
+        pattern = re.compile(
+            r'(\d{1,2})\s*차\s+'
+            r'(\d{4}-\d{2}-\d{2})\s+'
+            r'(\d{4}-\d{2}-\d{2})\s+'
+            r'(\d{4}-\d{2}-\d{2})'
+            r'(?:\s+(\d{2,3}\.\d{1,6}))?'
+        )
+        matches = pattern.findall(put_section)
         
         schedule = []
-        for i in range(len(dates) // 3):
+        seen_chasu = set()
+        for m in matches:
+            chasu = int(m[0])
+            if chasu in seen_chasu:
+                continue  # 중복 방지
+            seen_chasu.add(chasu)
             schedule.append({
-                'chasu': i + 1,
-                'from_date': dates[i*3],
-                'to_date': dates[i*3+1],
-                'pay_date': dates[i*3+2],
-                'rate': rates[i] if i < len(rates) else '',
+                'chasu': chasu,
+                'from_date': m[1],
+                'to_date': m[2],
+                'pay_date': m[3],
+                'rate': m[4] if m[4] else '',
             })
+        
+        # 차수 기반 파싱이 실패한 경우 (표 형식 아님) → 기존 방식 폴백
+        if not schedule:
+            dates = re.findall(r'\d{4}-\d{2}-\d{2}', put_section)
+            rates = re.findall(r'(\d{2,3}\.\d{2,6})\s*%', put_section)
+            for i in range(len(dates) // 3):
+                schedule.append({
+                    'chasu': i + 1,
+                    'from_date': dates[i*3],
+                    'to_date': dates[i*3+1],
+                    'pay_date': dates[i*3+2],
+                    'rate': rates[i] if i < len(rates) else '',
+                })
+        
+        # 차수 순 정렬
+        schedule.sort(key=lambda x: x['chasu'])
         return schedule
 
     for text in texts_primary:
@@ -704,9 +753,9 @@ def dart_parse_disclosure(correction_rcept_no, original_rcept_no, xrc_price=''):
         result['put_date'] = '-'
         print("  ℹ PUT 없음(-)")
 
-    # CALL (전체 스케줄 추출)
+    # CALL (전체 스케줄 추출) - 차수 기반 파싱
     def _call_all(clean):
-        """모든 CALL 차수 추출"""
+        """모든 CALL 차수 추출 - 차수 번호 기반 파싱"""
         call_idx = -1
         for kw in [
             '매도청구권(Call Option)', '매도청구권(call option)',
@@ -719,7 +768,22 @@ def dart_parse_disclosure(correction_rcept_no, original_rcept_no, xrc_price=''):
         if call_idx < 0:
             return [], '', ''
         
-        call_section = clean[call_idx: call_idx + 5000]
+        # CALL 섹션 끝 지점 찾기
+        end_markers = [
+            '주식으로의 전환청구', '전환에 관한 사항',
+            '가) 사채의 종류', '나) 사채의 종류',
+            '기타 투자판단', '기타 특약사항', '기타사항',
+            '제7조', '제8조',
+            '전환청구', '전환권',
+            '조기상환청구권', '[조기상환청구권',  # 뒤에 PUT이 다시 나오는 경우 대비
+        ]
+        call_end = call_idx + 8000
+        for marker in end_markers:
+            m_idx = clean.find(marker, call_idx + 100)
+            if m_idx > 0 and m_idx < call_end:
+                call_end = m_idx
+        
+        call_section = clean[call_idx: call_end]
         
         # YTC
         ytc = ''
@@ -752,20 +816,46 @@ def dart_parse_disclosure(correction_rcept_no, original_rcept_no, xrc_price=''):
                 except Exception:
                     pass
         
-        # CALL 스케줄
-        dates = re.findall(r'\d{4}-\d{2}-\d{2}', call_section)
-        rates = re.findall(r'(\d{2,3}\.\d{2,6})\s*%', call_section)
+        # 차수 기반 파싱: "N차 YYYY-MM-DD YYYY-MM-DD YYYY-MM-DD [비율]"
+        pattern = re.compile(
+            r'(\d{1,2})\s*차\s+'
+            r'(\d{4}-\d{2}-\d{2})\s+'
+            r'(\d{4}-\d{2}-\d{2})\s+'
+            r'(\d{4}-\d{2}-\d{2})'
+            r'(?:\s+(\d{2,3}\.\d{1,6}))?'
+        )
+        matches = pattern.findall(call_section)
         
         schedule = []
-        for i in range(len(dates) // 3):
+        seen_chasu = set()
+        for m in matches:
+            chasu = int(m[0])
+            if chasu in seen_chasu:
+                continue
+            seen_chasu.add(chasu)
             schedule.append({
-                'chasu': i + 1,
-                'from_date': dates[i*3],
-                'to_date': dates[i*3+1],
-                'pay_date': dates[i*3+2],
-                'rate': rates[i] if i < len(rates) else '',
+                'chasu': chasu,
+                'from_date': m[1],
+                'to_date': m[2],
+                'pay_date': m[3],
+                'rate': m[4] if m[4] else '',
             })
         
+        # 폴백: 차수 기반 파싱 실패 시 기존 방식
+        if not schedule:
+            dates = re.findall(r'\d{4}-\d{2}-\d{2}', call_section)
+            rates = re.findall(r'(\d{2,3}\.\d{2,6})\s*%', call_section)
+            for i in range(len(dates) // 3):
+                schedule.append({
+                    'chasu': i + 1,
+                    'from_date': dates[i*3],
+                    'to_date': dates[i*3+1],
+                    'pay_date': dates[i*3+2],
+                    'rate': rates[i] if i < len(rates) else '',
+                })
+        
+        # 차수 순 정렬
+        schedule.sort(key=lambda x: x['chasu'])
         return schedule, ytc, ratio
 
     for text in texts_primary:
