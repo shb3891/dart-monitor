@@ -1,5 +1,5 @@
 """
-dart-monitor main.py (v2.1)
+dart-monitor main.py (v2.2)
 - 기존 기능: 시트1 자동 갱신 (133개 종목, 자동 확장)
 - 풋콜스케줄 시트 자동 갱신 (6종 이벤트)
 - 자본변동 감지 (액면병합/분할/무상증자)
@@ -7,6 +7,9 @@ dart-monitor main.py (v2.1)
 - v2.1 FIX: PUT/CALL 스케줄 파싱을 차수(N차) 기반으로 재작성
   → 이전: 날짜 3개씩 순서로 묶어서 차수 부여 (뒤죽박죽)
   → 지금: PDF 표에서 "N차 FROM TO 지급일" 패턴 직접 매칭
+- v2.2 FIX: 풋콜스케줄 시트 클리어 범위 버그 수정
+  → 이전: A2:I3000 하드코딩 (3001행 이상 잔재 데이터 남음)
+  → 지금: 시트 실제 행 수 기준으로 전체 클리어
 """
 
 import asyncio
@@ -1205,9 +1208,15 @@ def update_schedule_sheet(all_schedule_rows):
     import time
     time.sleep(1.5)
     
-    # 기존 데이터 클리어 (A2부터)
-    last_row = max(3000, len(all_schedule_rows) + 10)
-    ws_schedule.batch_clear([f'A2:I{last_row}'])
+    # 기존 데이터 클리어 - 시트 전체 실제 행 수 기준
+    # ⚠ 하드코딩 3000이면 이전 실행에서 3000행 이상이던 경우 잔재 데이터 남음
+    try:
+        current_row_count = ws_schedule.row_count  # 시트의 실제 총 행 수
+    except Exception:
+        current_row_count = 5000  # 안전 폴백
+    clear_last_row = max(current_row_count, len(all_schedule_rows) + 100)
+    ws_schedule.batch_clear([f'A2:I{clear_last_row}'])
+    print(f"  🧹 A2:I{clear_last_row} 클리어 (이전 잔재 제거)")
     time.sleep(1.5)
     
     # 일괄 업데이트
