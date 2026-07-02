@@ -248,6 +248,16 @@ def ensure_holding_columns(ws_portfolio, headers, header_map):
     end_letter = get_column_letter(start_col + len(new_cols))
     
     range_str = f'{start_letter}1:{end_letter}1'
+    
+    # 시트 컬럼 수 확인 후 부족하면 확장
+    current_cols = ws_portfolio.col_count
+    needed_cols = start_col + len(new_cols)
+    if needed_cols > current_cols:
+        add_cols = needed_cols - current_cols + 2  # 여유있게 2개 더
+        print(f"  🔧 시트 컬럼 확장: {current_cols} → {current_cols + add_cols}")
+        ws_portfolio.add_cols(add_cols)
+        time.sleep(1.0)
+    
     ws_portfolio.update([new_cols], range_name=range_str)
     
     # 스타일링
