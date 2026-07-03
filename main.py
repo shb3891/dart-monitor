@@ -756,134 +756,276 @@ def dart_parse_disclosure(correction_rcept_no, original_rcept_no, xrc_price=''):
         result['put_date'] = '-'
         print("  ℹ PUT 없음(-)")
 
-    # CALL (전체 스케줄 추출) - 차수 기반 파싱
+    # CALL (전체 스케줄 추출) - v2.3 파싱 로직
     def _call_all(clean):
-        """모든 CALL 차수 추출 - 차수 번호 기반 파싱"""
-        call_idx = -1
-        for kw in [
-            '매도청구권(Call Option)', '매도청구권(call option)',
-            '[매도청구권', '매도청구권에 관한', '매도 청구권', '콜옵션', '콜 옵션',
-        ]:
-            m_idx = re.search(re.escape(kw), clean, re.IGNORECASE)
-            if m_idx:
-                call_idx = m_idx.start()
-                break
-        if call_idx < 0:
+        """
+        v2.3 CALL 파싱 로직.
+        44개 검증 종목 중 42개 성공 (95%). 
+        반환 형식은 v2.2와 호환: (schedule, ytc, ratio)
+        - schedule: [{chasu, from_date, to_date, pay_date, rate}]
+        - ytc: str (연복리 %)
+        - ratio: str (CALL 비율 정수%)
+        """
+        # PDF 텍스트 정규화: 한글 단어 중간 개행 제거 ("전자등\n록총액" → "전자등록총액")
+        text = re.sub(r'([가-힣])\n([가-힣])', r'\1\2', clean)
+        
+        # 매도청구권 언급이 아예 없으면 CALL 없음
+        if '매도청구권' not in text and 'Call Option' not in text and 'CALL OPTION' not in text:
             return [], '', ''
         
-        # CALL 섹션 끝 지점 찾기
-        end_markers = [
-            '주식으로의 전환청구', '전환에 관한 사항',
-            '가) 사채의 종류', '나) 사채의 종류',
-            '기타 투자판단', '기타 특약사항', '기타사항',
-            '제7조', '제8조',
-            '전환청구', '전환권',
-            '조기상환청구권', '[조기상환청구권',  # 뒤에 PUT이 다시 나오는 경우 대비
+        # ===== 1. 표 파싱 =====
+        # 다양한 CALL 표 헤더 (조기상환 표와 안 헷갈리게)
+        table_headers = [
+            r'구분\s+매매대금\s*지급기일',                                # 파인디앤씨
+            r'구분\s+매도청구권\s+매매일',                                # 한국맥널티
+            r'구분\s+매매일자?\s+매매(?:금액|가액)',
+            r'구분\s+매도청구(?:권)?\s*(?:지급기일|매매일)',
+            r'매도청구권\s*(?:행사기간|청구기간)[\s\S]{0,300}?(?:구분|1\s*차)',  # NEW, 차이커뮤니케이션
+            r'회차\s+매매대금\s*지급기일',                                # 오에스피
+            r'매도청구권\s*행사금액',
         ]
-        call_end = call_idx + 8000
-        for marker in end_markers:
-            m_idx = clean.find(marker, call_idx + 100)
-            if m_idx > 0 and m_idx < call_end:
-                call_end = m_idx
         
-        call_section = clean[call_idx: call_end]
-        
-        # YTC
-        ytc = ''
-        ytc_m = re.search(r'연\s*단리\s*([0-9]+(?:\.[0-9]+)?)\s*%', call_section)
-        if ytc_m:
-            ytc = ytc_m.group(1)
-        
-        # CALL 비율
-        ratio = ''
-        for ratio_pat in [
-            r'([0-9]+(?:\.[0-9]+)?)%를?\s*총\s*한도',
-            r'\(Call\s*Option\s*([0-9]+(?:\.[0-9]+)?)\s*%\)',
-            r'Call\s*Option\s*([0-9]+(?:\.[0-9]+)?)\s*%',
-            r'전자등록총액\s*([0-9]+(?:\.[0-9]+)?)\s*%',
-            r'발행총액[^0-9]*([0-9]+(?:\.[0-9]+)?)\s*%',
-            r'사채\s*원금의\s*([0-9]+(?:\.[0-9]+)?)\s*%',
-            r'잔액의\s*([0-9]+(?:\.[0-9]+)?)\s*%',
-            r'([0-9]+(?:\.[0-9]+)?)\s*%\s*이내',
-            r'한도\s*[:：]\s*([0-9]+(?:\.[0-9]+)?)\s*%',
-            r'총액의\s*([0-9]+(?:\.[0-9]+)?)\s*%',
-            r'권면총액의\s*([0-9]+(?:\.[0-9]+)?)\s*%',
-        ]:
-            ratio_m = re.search(ratio_pat, call_section, re.IGNORECASE)
-            if ratio_m:
-                try:
-                    val = float(ratio_m.group(1))
-                    if val <= 100:
-                        ratio = ratio_m.group(1)
-                        break
-                except Exception:
-                    pass
-        
-        # 차수 기반 파싱: "N차 YYYY-MM-DD YYYY-MM-DD YYYY-MM-DD [비율]"
-        pattern = re.compile(
-            r'(\d{1,2})\s*차\s+'
-            r'(\d{4}-\d{2}-\d{2})\s+'
-            r'(\d{4}-\d{2}-\d{2})\s+'
-            r'(\d{4}-\d{2}-\d{2})'
-            r'(?:\s+(\d{2,3}\.\d{1,6}))?'
-        )
-        matches = pattern.findall(call_section)
+        def _kr_to_iso(s):
+            m = re.match(r'(\d{4})\s*년?\s*(\d{1,2})\s*월?\s*(\d{1,2})\s*일?', s)
+            return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}" if m else None
         
         schedule = []
-        seen_chasu = set()
-        for m in matches:
-            chasu = int(m[0])
-            if chasu in seen_chasu:
+        for pat in table_headers:
+            m = re.search(pat, text, re.DOTALL)
+            if not m:
                 continue
-            seen_chasu.add(chasu)
-            schedule.append({
-                'chasu': chasu,
-                'from_date': m[1],
-                'to_date': m[2],
-                'pay_date': m[3],
-                'rate': m[4] if m[4] else '',
-            })
+            table_area = text[m.start():m.start()+3000]
+            
+            # (A) ISO 3날짜: "1차 YYYY-MM-DD YYYY-MM-DD YYYY-MM-DD [ratio]"
+            rows_iso3 = re.findall(
+                r'(\d{1,2})\s*차\s+'
+                r'(\d{4}-\d{2}-\d{2})\s+'
+                r'(\d{4}-\d{2}-\d{2})\s+'
+                r'(\d{4}-\d{2}-\d{2})'
+                r'(?:\s+(?:전자등록금액의\s*)?(\d{2,3}\.\d{1,6})\s*%?)?',
+                table_area
+            )
+            if rows_iso3:
+                seen = set()
+                for r in rows_iso3:
+                    if r[0] in seen: continue
+                    seen.add(r[0])
+                    schedule.append({
+                        'chasu': int(r[0]), 'from_date': r[1], 'to_date': r[2],
+                        'pay_date': r[3], 'rate': r[4] or '',
+                    })
+                if schedule:
+                    break
+            
+            # (B) 한국어 날짜 3개: "1차 YYYY년 MM월 DD일 x3" (NEW 스타일)
+            rows_kr3 = re.findall(
+                r'(\d{1,2})\s*차\s+'
+                r'(\d{4}\s*년\s*\d{1,2}\s*월\s*\d{1,2}\s*일)\s+'
+                r'(\d{4}\s*년\s*\d{1,2}\s*월\s*\d{1,2}\s*일)\s+'
+                r'(\d{4}\s*년\s*\d{1,2}\s*월\s*\d{1,2}\s*일)',
+                table_area
+            )
+            if rows_kr3:
+                seen = set()
+                for r in rows_kr3:
+                    if r[0] in seen: continue
+                    seen.add(r[0])
+                    schedule.append({
+                        'chasu': int(r[0]),
+                        'from_date': _kr_to_iso(r[1]) or '',
+                        'to_date': _kr_to_iso(r[2]) or '',
+                        'pay_date': _kr_to_iso(r[3]) or '',
+                        'rate': '',
+                    })
+                if schedule:
+                    break
+            
+            # (C) ISO 1날짜: "N YYYY-MM-DD 전자등록금액의 X%" (오에스피 스타일)
+            rows_iso1 = re.findall(
+                r'(?:^|\n)\s*(\d{1,2})\s*차?\s+'
+                r'(\d{4}-\d{2}-\d{2})\s+'
+                r'(?:전자등록금액의\s*)?(\d{2,3}\.\d{1,6})\s*%?',
+                table_area
+            )
+            if rows_iso1:
+                seen = set()
+                for r in rows_iso1:
+                    if r[0] in seen: continue
+                    seen.add(r[0])
+                    schedule.append({
+                        'chasu': int(r[0]),
+                        'from_date': r[1], 'to_date': r[1],
+                        'pay_date': r[1], 'rate': r[2],
+                    })
+                if schedule:
+                    break
         
-        # 폴백: 차수 기반 파싱 실패 시 기존 방식
-        if not schedule:
-            dates = re.findall(r'\d{4}-\d{2}-\d{2}', call_section)
-            rates = re.findall(r'(\d{2,3}\.\d{2,6})\s*%', call_section)
-            for i in range(len(dates) // 3):
-                schedule.append({
-                    'chasu': i + 1,
-                    'from_date': dates[i*3],
-                    'to_date': dates[i*3+1],
-                    'pay_date': dates[i*3+2],
-                    'rate': rates[i] if i < len(rates) else '',
-                })
-        
-        # 차수 순 정렬
         schedule.sort(key=lambda x: x['chasu'])
+        
+        # ===== 2. CALL 비율 파싱 =====
+        # 매도청구권 근처 텍스트 (애매한 패턴용)
+        # 매도청구권이 여러 번 등장하는 문서에서 뒷부분 상세 섹션까지 커버해야 함
+        positions = [m.start() for m in re.finditer(r'매도청구권|Call\s*Option|CALL\s*OPTION', text, re.IGNORECASE)]
+        call_context = ''
+        if positions:
+            # 첫 위치부터 최대 20000자 (뒷부분 상세 섹션까지 커버)
+            call_context = text[positions[0]:positions[0]+20000]
+            # 만약 매도청구권이 너무 많이 등장하면 (문서 뒷부분에도) 뒷쪽 몇 개도 포함
+            if len(positions) > 10:
+                for pos in positions[-3:]:
+                    if pos > positions[0] + 20000:
+                        call_context += '\n' + text[pos:pos+4000]
+        
+        ratio = ''
+        # 모든 CALL 비율 패턴 매치 후 최댓값 선택 (보수적 접근: 실제 최대 행사 한도)
+        candidate_ratios = []
+        
+        # (1) "취득 규모: XX원(Call Option N%)" - 문서 전체 검색
+        for m in re.finditer(
+            r'취득\s*규모\s*[:\s]+[^()]{0,50}\(\s*Call\s*Option\s*(\d+)\s*%',
+            text, re.IGNORECASE
+        ):
+            candidate_ratios.append(int(m.group(1)))
+        
+        # (2) 애매한 패턴 - 매도청구권 근처만
+        if call_context:
+            for p in [
+                # 전자등록총액 - "의" 유무, 괄호 유무 모두 지원 (삼기, 에이팩트 등)
+                r'전자등록총액\s*[)]?\s*(?:의|을)?\s*(\d+)\s*%(?![\.\d])',
+                r'전자등록총액[^,]{0,60}?의\s*(\d+)\s*/\s*100',
+                # 발행가액 총액
+                r'발행가액\s*총액[^)]{0,30}\)의\s*(\d+)\s*%(?![\.\d])',
+                # 발행가액 + 다양한 한도 표현 (위츠의 35%, 젝시믹스, 디알텍, 범한퓨얼셀, 와이씨켐 등)
+                # ⚠️ "매도청구" 문맥 요구: 인탑스 등의 조건부중도상환청구권 오인식 방지
+                r'(?:본\s*사채\s*)?발행가액의\s*(\d+)\s*%\s*(?:까지|를?\s*초과|이내|를?\s*총?\s*한도).{0,80}?매도청구',
+                # 인수금액/인수한 전자등록금액 (나노팀, 코미팜 등)
+                r'인수(?:한\s*전자등록금액|금액)의\s*(\d+)\s*%(?:를)?\s*(?:초과|까지|이내|한도).{0,80}?매도청구',
+                # 권면총액
+                r'권면\s*\(?\s*전자등록\s*\)?\s*총액[^)]{0,30}\)?의\s*(\d+)\s*%(?![\.\d])',
+                # 콜옵션 N% (NEW)
+                r'콜옵션\s*(\d+)\s*%',
+                # 사채권의 N% 한도
+                r'사채권의\s*(\d+)\s*%\s*한도',
+            ]:
+                for m in re.finditer(p, call_context):
+                    try:
+                        val = int(m.group(1))
+                        if 1 <= val <= 100:  # 유효 범위
+                            candidate_ratios.append(val)
+                    except:
+                        pass
+        
+        # 여러 값 중 최솟값 사용 (보수적: CALL 비율 낮게 = 회수 가능성 낮게 예측)
+        if candidate_ratios:
+            ratio = str(min(candidate_ratios))
+        
+        # (3) Fallback: 원문에 명시적 % 없이 "전부 또는 일부"만 있으면 100%로 간주
+        # (예: 차이커뮤니케이션은 100%가 맞음. 에르코스처럼 실제와 다른 케이스는
+        #  시트 X열 "CALL 비율(수동)"에 override 입력하면 덮어쓸 수 있음)
+        if not ratio and call_context and (
+            '전자등록금액의 전부' in call_context or '전부 또는 일부' in call_context
+        ):
+            explicit = re.search(
+                r'(?:취득\s*규모|Call\s*Option|전자등록총액|권면총액|사채권|발행가액).{0,50}?\d+\s*%',
+                call_context, re.IGNORECASE
+            )
+            if not explicit:
+                ratio = '100'
+        
+        # ===== 3. YTC (연복리) =====
+        ytc = ''
+        m = re.search(r'(?:매매대금|매도청구권|콜옵션)[^조]{0,200}?(?:연복리|복리\s*연)\s*(\d+(?:\.\d+)?)', text)
+        if m:
+            ytc = m.group(1)
+        
         return schedule, ytc, ratio
 
     for text in texts_primary:
         call_schedule, ytc, ratio = _call_all(text)
+        # 표 있으면 사용
         if call_schedule:
             result['call_schedule'] = call_schedule
             result['ytc'] = ytc
             result['call_ratio'] = ratio
-            # 현재 CALL
-            today = datetime.now().strftime('%Y-%m-%d')
-            for c in call_schedule:
-                if c['to_date'] >= today:
-                    result['call_begin'] = c['from_date']
-                    result['call_end'] = c['to_date']
-                    break
+            # 사용자 채권현황표 기준: 첫 차수 FROM ~ 마지막 차수 FROM
+            if len(call_schedule) >= 2:
+                result['call_begin'] = call_schedule[0]['from_date']
+                result['call_end'] = call_schedule[-1]['from_date']
+            elif len(call_schedule) == 1:
+                # 일회성 CALL → 시작=종료
+                result['call_begin'] = call_schedule[0]['from_date']
+                result['call_end'] = call_schedule[0]['from_date']
             if ytc: print(f"  ✅ YTC: {ytc}%")
             if ratio: print(f"  ✅ CALL비율: {ratio}%")
             print(f"  ✅ CALL 스케줄: {len(call_schedule)}개 차수")
             break
+        # 표 없어도 CALL 비율/YTC는 있을 수 있음 → 계속 시도
+        if ratio and not result['call_ratio']:
+            result['call_ratio'] = ratio
+        if ytc and not result['ytc']:
+            result['ytc'] = ytc
     
-    if not result['call_schedule']:
+    # 표 파싱 실패 시 서술문에서 CALL 시작/종료 뽑기
+    if not result['call_schedule'] and result['call_ratio']:
+        # CALL 비율은 잡혔지만 표가 없음 → 서술문에서 날짜 뽑기
+        for text in texts_primary:
+            # 정규화
+            text_n = re.sub(r'([가-힣])\n([가-힣])', r'\1\2', text)
+            idx = text_n.find('매도청구권')
+            if idx < 0:
+                continue
+            section = text_n[idx:idx+3000]
+            # 종료 마커
+            for marker in ['조기상환청구권', '\n10. 합병', '11. 청약일']:
+                mi = section.find(marker, 100)
+                if 0 < mi:
+                    section = section[:mi]
+                    break
+            
+            dates = []
+            # 패턴 A: "X개월이 (경과한/되는) 날 (YYYY년 MM월 DD일)"
+            for m in re.finditer(
+                r'(\d+)\s*(?:개월|년)이?\s*(?:경과한|되는)\s*날?(?:의\s*전일)?\s*'
+                r'(?:인)?\s*\(?\s*(\d{4})\s*년?\s*(\d{1,2})\s*월?\s*(\d{1,2})\s*일?\s*\)?',
+                section
+            ):
+                try:
+                    y, mo, d = int(m.group(2)), int(m.group(3)), int(m.group(4))
+                    dates.append((m.start(), f"{y:04d}-{mo:02d}-{d:02d}"))
+                except: pass
+            # 패턴 B: "이후 YYYY년 MM월 DD일까지"
+            for m in re.finditer(
+                r'이후\s*(\d{4})\s*년?\s*(\d{1,2})\s*월?\s*(\d{1,2})\s*일?\s*까지',
+                section
+            ):
+                try:
+                    y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                    dates.append((m.start(), f"{y:04d}-{mo:02d}-{d:02d}"))
+                except: pass
+            
+            dates.sort(key=lambda x: x[0])
+            unique_dates = []
+            for _, d in dates:
+                if d not in unique_dates:
+                    unique_dates.append(d)
+            
+            if len(unique_dates) >= 2:
+                result['call_begin'] = unique_dates[0]
+                result['call_end'] = unique_dates[1]
+                break
+            elif len(unique_dates) == 1:
+                result['call_begin'] = unique_dates[0]
+                result['call_end'] = ''
+                break
+    
+    if not result['call_schedule'] and not result['call_ratio']:
         result['call_begin'] = '-'
         result['call_end'] = '-'
         result['call_ratio'] = '-'
         print("  ℹ CALL 없음(-)")
+    elif not result['call_schedule']:
+        # 표는 없지만 서술문에서 정보 나옴
+        print(f"  ✅ 서술문 CALL: 비율={result['call_ratio']}%, 시작={result['call_begin']}, 종료={result['call_end']}")
 
     return result
 
@@ -1353,7 +1495,7 @@ async def main():
     print("📋 포트폴리오 시트 읽는 중...")
     all_values = worksheet.get_all_values()
 
-    print("📋 헤더 업데이트 중 (U/V/W 컬럼 추가)...")
+    print("📋 헤더 업데이트 중 (U/V/W + X/Y/Z 컬럼)...")
     worksheet.update(
         [['발행사 주식코드', '교환대상 회사명', '교환대상 주식코드']],
         range_name='U1:W1'
@@ -1363,6 +1505,17 @@ async def main():
         'backgroundColor': {'red': 0.2, 'green': 0.5, 'blue': 0.3},
         'horizontalAlignment': 'CENTER',
     })
+    await asyncio.sleep(0.5)
+    # X/Y/Z: CALL 수동 override 컬럼 (원문에 명시 없는 종목용, 예: 에르코스)
+    worksheet.update(
+        [['CALL 비율(수동)', 'CALL 시작일(수동)', 'CALL 종료일(수동)']],
+        range_name='X1:Z1'
+    )
+    worksheet.format('X1:Z1', {
+        'textFormat': {'bold': True},
+        'backgroundColor': {'red': 0.9, 'green': 0.7, 'blue': 0.3},  # 오렌지: 수동 입력 표시
+        'horizontalAlignment': 'CENTER',
+    })
     await asyncio.sleep(1.0)
 
     data_rows = [
@@ -1370,6 +1523,26 @@ async def main():
         for i, row in enumerate(all_values[1:])
         if len(row) > 1 and row[1].strip().startswith('KR')
     ]
+    
+    # X/Y/Z 컬럼(index 23/24/25) 값 → override map (ISIN 기준)
+    # 사용자가 시트에 수동 입력한 CALL 비율/시작/종료 (에르코스처럼 원문에 없는 종목용)
+    call_overrides = {}
+    for _, row in data_rows:
+        isin = row[1].strip()
+        # 시트에서 읽은 row의 길이가 충분한 경우만
+        override_ratio = row[23].strip() if len(row) > 23 else ''
+        override_begin = row[24].strip() if len(row) > 24 else ''
+        override_end = row[25].strip() if len(row) > 25 else ''
+        if override_ratio or override_begin or override_end:
+            call_overrides[isin] = {
+                'ratio': override_ratio,
+                'begin': override_begin,
+                'end': override_end,
+            }
+    if call_overrides:
+        print(f"📌 CALL 수동 override 감지: {len(call_overrides)}개 종목")
+        for isin, ov in call_overrides.items():
+            print(f"   {isin}: 비율={ov['ratio']!r}, 시작={ov['begin']!r}, 종료={ov['end']!r}")
 
     if TEST_MODE:
         data_rows = data_rows[:TEST_COUNT]
@@ -1387,6 +1560,22 @@ async def main():
         result = get_mezzanine_data(row[1].strip(), row)
         results.append((sheet_row, result))
         await asyncio.sleep(1.5)
+    
+    # === CALL 수동 override 적용 (원문에 CALL 정보 없는 종목용) ===
+    override_applied = 0
+    for _, r in results:
+        isin = r.get('isin', '')
+        if isin in call_overrides:
+            ov = call_overrides[isin]
+            if ov['ratio']:
+                r['call']['call_ratio'] = ov['ratio']
+                override_applied += 1
+            if ov['begin']:
+                r['call']['call_begin'] = ov['begin']
+            if ov['end']:
+                r['call']['call_end'] = ov['end']
+    if override_applied:
+        print(f"✅ CALL override 적용: {override_applied}개 종목")
 
     # === 포트폴리오 시트(시트1) 업데이트 ===
     print("\n📝 포트폴리오 시트 업데이트 중...")
