@@ -520,6 +520,7 @@ def dart_parse_disclosure(correction_rcept_no, original_rcept_no, xrc_price=''):
         'xrc_begin_dart': '', 'xrc_end_dart': '',
         'put_begin': '', 'put_end': '', 'put_date': '',
         'call_ratio': '', 'call_begin': '', 'call_end': '',
+        'call_fallback': False,  # NEW: fallback 100%로 잡힌 종목 (수동 확인 필요)
         'ytc': '',
         'refix_cycle_months': None,  # NEW
         'put_schedule': [],  # NEW: 모든 PUT 차수
@@ -916,6 +917,7 @@ def dart_parse_disclosure(correction_rcept_no, original_rcept_no, xrc_price=''):
                         pass
         
         # 여러 값 중 최솟값 사용 (보수적: CALL 비율 낮게 = 회수 가능성 낮게 예측)
+        is_fallback = False  # 100% fallback 발동 여부 (시트 강조 표시용)
         if candidate_ratios:
             ratio = str(min(candidate_ratios))
         
@@ -931,6 +933,7 @@ def dart_parse_disclosure(correction_rcept_no, original_rcept_no, xrc_price=''):
             )
             if not explicit:
                 ratio = '100'
+                is_fallback = True  # 명시 없이 추정한 값 → 사용자 확인 필요
         
         # ===== 3. YTC (연복리) =====
         ytc = ''
@@ -938,15 +941,16 @@ def dart_parse_disclosure(correction_rcept_no, original_rcept_no, xrc_price=''):
         if m:
             ytc = m.group(1)
         
-        return schedule, ytc, ratio
+        return schedule, ytc, ratio, is_fallback
 
     for text in texts_primary:
-        call_schedule, ytc, ratio = _call_all(text)
+        call_schedule, ytc, ratio, is_fb = _call_all(text)
         # 표 있으면 사용
         if call_schedule:
             result['call_schedule'] = call_schedule
             result['ytc'] = ytc
             result['call_ratio'] = ratio
+            result['call_fallback'] = is_fb
             # 사용자 채권현황표 기준: 첫 차수 FROM ~ 마지막 차수 FROM
             if len(call_schedule) >= 2:
                 result['call_begin'] = call_schedule[0]['from_date']
@@ -956,12 +960,13 @@ def dart_parse_disclosure(correction_rcept_no, original_rcept_no, xrc_price=''):
                 result['call_begin'] = call_schedule[0]['from_date']
                 result['call_end'] = call_schedule[0]['from_date']
             if ytc: print(f"  ✅ YTC: {ytc}%")
-            if ratio: print(f"  ✅ CALL비율: {ratio}%")
+            if ratio: print(f"  ✅ CALL비율: {ratio}%{'  ⚠️ (fallback - 확인 필요)' if is_fb else ''}")
             print(f"  ✅ CALL 스케줄: {len(call_schedule)}개 차수")
             break
         # 표 없어도 CALL 비율/YTC는 있을 수 있음 → 계속 시도
         if ratio and not result['call_ratio']:
             result['call_ratio'] = ratio
+            result['call_fallback'] = is_fb
         if ytc and not result['ytc']:
             result['ytc'] = ytc
     
@@ -1190,6 +1195,7 @@ def get_mezzanine_data(isin, existing_row):
         'xrc_begin_dart': '', 'xrc_end_dart': '',
         'put_begin': '', 'put_end': '', 'put_date': '',
         'call_ratio': '', 'call_begin': '', 'call_end': '',
+        'call_fallback': False,
         'ytc': '',
         'refix_cycle_months': None,
         'put_schedule': [], 'call_schedule': [],
@@ -1216,12 +1222,13 @@ def get_mezzanine_data(isin, existing_row):
         }
 
     if dart_data['call_ratio'] == '-':
-        final_call = {'call_ratio': '-', 'call_begin': '-', 'call_end': '-'}
+        final_call = {'call_ratio': '-', 'call_begin': '-', 'call_end': '-', 'fallback': False}
     else:
         final_call = {
             'call_ratio': dart_data['call_ratio'] or seibro_pc['call_ratio'],
             'call_begin': dart_data['call_begin'] or seibro_pc['call_begin'],
             'call_end': dart_data['call_end'] or seibro_pc['call_end'],
+            'fallback': dart_data.get('call_fallback', False),
         }
 
     return {
@@ -1569,6 +1576,7 @@ async def main():
             ov = call_overrides[isin]
             if ov['ratio']:
                 r['call']['call_ratio'] = ov['ratio']
+                r['call']['fallback'] = False  # override로 덮였으니 flag 해제
                 override_applied += 1
             if ov['begin']:
                 r['call']['call_begin'] = ov['begin']
@@ -1603,6 +1611,30 @@ async def main():
     await asyncio.sleep(1.0)
     upd(f"Q{fr}:S{lr}", [[r['call']['call_ratio'], r['call']['call_begin'], r['call']['call_end']] for _, r in results])
     await asyncio.sleep(1.0)
+    
+    # ⚠️ CALL 비율 시각화: 전체 Q열 흰색 리셋 후 fallback 종목만 노란색 (수동 확인 알림)
+    fallback_rows = [sr for sr, r in results if r['call'].get('fallback')]
+    # 전체 Q열 배경 초기화 (이전 실행의 노란색 제거)
+    try:
+        worksheet.format(f'Q{fr}:Q{lr}', {
+            'backgroundColor': {'red': 1.0, 'green': 1.0, 'blue': 1.0}
+        })
+        await asyncio.sleep(0.5)
+    except: pass
+    # Fallback 종목만 노란색으로
+    if fallback_rows:
+        print(f"\n⚠️ Fallback CALL 비율 종목 {len(fallback_rows)}개 (Q열 노란색 표시 - 수동 확인 필요):")
+        for sr in fallback_rows:
+            try:
+                worksheet.format(f'Q{sr}', {
+                    'backgroundColor': {'red': 1.0, 'green': 0.95, 'blue': 0.5},  # 연한 노란색
+                })
+                # 셀에 노트(comment) 추가
+                cell_notes = [{'range': {'sheetId': worksheet.id, 'startRowIndex': sr-1, 'endRowIndex': sr, 'startColumnIndex': 16, 'endColumnIndex': 17}, 
+                              'note': 'CALL 비율이 원문에 명시 없어 100%로 추정됨. 계약서 등 확인 후 X열에 정확한 값 입력 필요.'}]
+                print(f"   행 {sr}")
+            except: pass
+        await asyncio.sleep(0.5)
     upd(f"T{fr}:T{lr}", [[r['ytc']] for _, r in results])
     await asyncio.sleep(1.0)
     upd(f"U{fr}:W{lr}", [[r['issuer_stock_code'], r['target_corp_name'], r['target_stock_code']] for _, r in results])
