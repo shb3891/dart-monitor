@@ -1288,6 +1288,32 @@ def update_capital_action_sheet(all_actions):
 # ============================================================
 # [메인 실행]
 # ============================================================
+def _valid_manual_call_ratio(raw):
+    """X열(CALL 비율 수동) 값 검증.
+    안전 규칙: 0 초과 100 이하의 숫자만 유효한 CALL 비율로 인정.
+      - 빈칸/'-'  → None (수동값 없음, 원문 파싱값 사용)
+      - 음수, 100 초과, 숫자 아님 → None (오염 의심, 무시하고 원문값 사용)
+      - 0         → 유효 (콜옵션 비율 0%. 남성/영흥 EB처럼 콜 없는 경우 명시)
+    과거 X/Y/Z에 보유내역 평가금액/수익률(-17.16, 202.26 등)이
+    오염 복사됐던 사고를 이 검증으로 차단한다.
+    반환: (문자열 비율, True) 또는 (None, False)
+    """
+    if raw is None:
+        return None, False
+    s = str(raw).strip().replace('%', '').replace(',', '')
+    if s == '' or s == '-':
+        return None, False
+    try:
+        v = float(s)
+    except ValueError:
+        return None, False
+    if v < 0 or v > 100:
+        return None, False
+    # 정수면 정수로, 소수면 그대로 (20.57 같은 값 보존)
+    out = str(int(v)) if v == int(v) else s
+    return out, True
+
+
 async def main():
     print(f"🔑 DART_KEY: {DART_KEY[:6]}...")
     if API_DART:
@@ -1302,6 +1328,11 @@ async def main():
         'textFormat': {'bold': True},
         'backgroundColor': {'red': 0.2, 'green': 0.5, 'blue': 0.3},
         'horizontalAlignment': 'CENTER'})
+    await asyncio.sleep(1.0)
+
+    # v2.5: X열만 "CALL 비율(수동)"로 사용. Y/Z(구 시작일·종료일 수동)는 폐기 → 헤더/데이터 비움.
+    print("📋 헤더 정리 중 (X=수동 CALL 비율 / Y·Z 폐기)...")
+    worksheet.update([['CALL 비율(수동)', '', '']], range_name='X1:Z1')
     await asyncio.sleep(1.0)
 
     # ⚠️ v2.4: X/Y/Z 수동 override 로직 완전 폐기.
@@ -1326,6 +1357,11 @@ async def main():
     results = []
     for sheet_row, row in data_rows:
         result = get_mezzanine_data(row[1].strip(), row)
+        # v2.5: X열(인덱스 23) 수동 CALL 비율 검증 후 부착 (Y/Z는 무시)
+        x_raw = row[23] if len(row) > 23 else ''
+        manual_ratio, has_manual = _valid_manual_call_ratio(x_raw)
+        result['_manual_call_ratio'] = manual_ratio
+        result['_has_manual_call'] = has_manual
         results.append((sheet_row, result))
         await asyncio.sleep(1.5)
 
@@ -1371,8 +1407,24 @@ async def main():
     await asyncio.sleep(1.0)
     upd(f"M{fr}:O{lr}", [[r['put']['put_begin'], r['put']['put_end'], r['put']['put_date']] for _, r in results])
     await asyncio.sleep(1.0)
+    # v2.5: X열 수동 CALL 비율이 유효하면 원문 파싱 비율을 대체 (R/S 날짜는 원문 유지)
+    #   수동값이 적용된 종목은 fallback(노란색) 대상에서도 제외
+    manual_applied = []
+    for sr, r in results:
+        if r.get('_has_manual_call'):
+            mr = r['_manual_call_ratio']
+            orig = r['call']['call_ratio']
+            r['call']['call_ratio'] = mr
+            r['call']['fallback'] = False  # 사람이 확정한 값이므로 경고 해제
+            manual_applied.append((sr, orig, mr))
+
     upd(f"Q{fr}:S{lr}", [[r['call']['call_ratio'], r['call']['call_begin'], r['call']['call_end']] for _, r in results])
     await asyncio.sleep(1.0)
+
+    if manual_applied:
+        print(f"\n✍️  X열 수동 CALL 비율 적용 {len(manual_applied)}개 (원문값 대체):")
+        for sr, orig, mr in manual_applied:
+            print(f"   행 {sr}: 원문 {orig or '-'} → 수동 {mr}%")
 
     # CALL 비율 시각화: fallback(원문에 % 없이 추정)만 노란색
     fallback_rows = [sr for sr, r in results if r['call'].get('fallback')]
