@@ -1448,6 +1448,11 @@ async def main():
     upd(f"U{fr}:W{lr}", [[r['issuer_stock_code'], r['target_corp_name'], r['target_stock_code']] for _, r in results])
     await asyncio.sleep(1.0)
 
+    # v2.5: 최근업데이트(AA열)를 오늘 날짜로 갱신 (main.py 실행 시각 기록)
+    #   update_holdings.py도 같은 AA열을 갱신하므로, 둘 중 나중에 실행된 쪽 날짜가 남는다.
+    upd(f"AA{fr}:AA{lr}", [[TODAY] for _ in results])
+    await asyncio.sleep(1.0)
+
     print("\n🔍 자본변동 감지 중...")
     holdings_for_ca = [(r['corp_name'], r['issuer_corp_code'], r['isin']) for _, r in results]
     capital_actions = detect_all_capital_actions(holdings_for_ca, days_back=30)
