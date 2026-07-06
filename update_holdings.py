@@ -183,16 +183,19 @@ def load_portfolio(ws_portfolio):
         h_clean = h.strip()
         if h_clean in ('종목명', 'A'):
             header_map['name_col'] = i
-        elif h_clean in ('ISIN', '채권ISIN', '종목코드'):
+        elif h_clean in ('ISIN', '채권ISIN', '종목코드', '예탁원 종목코드', '예탁원종목코드'):
             header_map['isin_col'] = i
         elif '보유금액' in h_clean or '보유수량' in h_clean:
             header_map['amount_col'] = i
-        elif '취득가' in h_clean and '원' not in h_clean:
+        elif '취득가' in h_clean:
+            # '취득가(억원)' 포함. (구버전의 "원 not in" 조건 제거 — 그 때문에 못 잡던 버그 수정)
             header_map['acq_col'] = i
         elif '평가액' in h_clean or '시가평가' in h_clean:
             header_map['eval_col'] = i
         elif '수익률' in h_clean:
             header_map['return_col'] = i
+        elif '최근업데이트' in h_clean or '최근 업데이트' in h_clean:
+            header_map['updated_col'] = i
     
     # ISIN 컬럼이 없으면 B열로 가정 (기존 main.py 구조)
     if 'isin_col' not in header_map:
@@ -212,77 +215,74 @@ def load_portfolio(ws_portfolio):
 # ============================================================
 def ensure_holding_columns(ws_portfolio, headers, header_map):
     """
-    포트폴리오 시트 끝에 보유 관련 컬럼이 없으면 추가
-    추가 컬럼: 보유금액(억원), 취득가(억원), 시가평가액(억원), 수익률(%), 최근업데이트
-    
+    포트폴리오 시트에 보유 관련 컬럼이 없으면 지정된 고정 위치에 추가.
+      - 취득가(억원): AB (이미 존재, idx 27)
+      - 최근업데이트: AA (이미 존재, idx 26)
+      - 시가평가액(억원): AC (idx 28) — 없으면 생성
+      - 수익률(%): AD (idx 29) — 없으면 생성
+    보유금액(amount)은 시트에서 취득가로 대체하므로 별도 생성하지 않음.
+
     Returns:
         업데이트된 header_map
     """
-    new_cols = []
-    
-    if 'amount_col' not in header_map:
-        new_cols.append('보유금액(억원)')
-    if 'acq_col' not in header_map:
-        new_cols.append('취득가(억원)')
-    if 'eval_col' not in header_map:
-        new_cols.append('시가평가액(억원)')
-    if 'return_col' not in header_map:
-        new_cols.append('수익률(%)')
-    
-    # 최근업데이트 컬럼도 추가
-    if '최근업데이트' not in headers:
-        new_cols.append('최근업데이트')
-    
-    if not new_cols:
-        print("  ✅ 보유 관련 컬럼 이미 존재")
-        return header_map
-    
-    # 마지막 컬럼 인덱스
-    start_col = len(headers)
-    
-    # 헤더 추가
-    print(f"  🆕 신규 컬럼 추가: {new_cols}")
-    
     from openpyxl.utils import get_column_letter
-    start_letter = get_column_letter(start_col + 1)
-    end_letter = get_column_letter(start_col + len(new_cols))
-    
-    range_str = f'{start_letter}1:{end_letter}1'
-    
-    # 시트 컬럼 수 확인 후 부족하면 확장
+
+    # 고정 위치 (0-based 인덱스)
+    AC_IDX = 28  # 시가평가액(억원)
+    AD_IDX = 29  # 수익률(%)
+
+    # 시트 컬럼 수가 부족하면 먼저 확장
     current_cols = ws_portfolio.col_count
-    needed_cols = start_col + len(new_cols)
+    needed_cols = AD_IDX + 1  # AD까지 = 30개 컬럼
     if needed_cols > current_cols:
-        add_cols = needed_cols - current_cols + 2  # 여유있게 2개 더
+        add_cols = needed_cols - current_cols + 2  # 여유 2개
         print(f"  🔧 시트 컬럼 확장: {current_cols} → {current_cols + add_cols}")
         ws_portfolio.add_cols(add_cols)
         time.sleep(1.0)
-    
-    ws_portfolio.update([new_cols], range_name=range_str)
-    
-    # 스타일링
-    ws_portfolio.format(range_str, {
-        'textFormat': {'bold': True, 'foregroundColor': {'red': 1, 'green': 1, 'blue': 1}},
-        'backgroundColor': {'red': 0.4, 'green': 0.5, 'blue': 0.3},
-        'horizontalAlignment': 'CENTER',
-    })
-    time.sleep(1.0)
-    
-    # header_map 업데이트
-    new_col_idx = start_col
-    for col_name in new_cols:
-        if '보유금액' in col_name:
-            header_map['amount_col'] = new_col_idx
-        elif '취득가' in col_name:
-            header_map['acq_col'] = new_col_idx
-        elif '평가액' in col_name:
-            header_map['eval_col'] = new_col_idx
-        elif '수익률' in col_name:
-            header_map['return_col'] = new_col_idx
-        elif '최근업데이트' in col_name:
-            header_map['updated_col'] = new_col_idx
-        new_col_idx += 1
-    
+
+    created = []
+
+    # 시가평가액 컬럼이 없으면 AC에 생성
+    if 'eval_col' not in header_map:
+        letter = get_column_letter(AC_IDX + 1)  # 'AC'
+        ws_portfolio.update([['시가평가액(억원)']], range_name=f'{letter}1')
+        header_map['eval_col'] = AC_IDX
+        created.append(f'{letter}1=시가평가액(억원)')
+        time.sleep(0.5)
+
+    # 수익률 컬럼이 없으면 AD에 생성
+    if 'return_col' not in header_map:
+        letter = get_column_letter(AD_IDX + 1)  # 'AD'
+        ws_portfolio.update([['수익률(%)']], range_name=f'{letter}1')
+        header_map['return_col'] = AD_IDX
+        created.append(f'{letter}1=수익률(%)')
+        time.sleep(0.5)
+
+    # updated_col(AA)이 헤더 인식에서 안 잡혔으면 AA(26)로 지정
+    if 'updated_col' not in header_map:
+        header_map['updated_col'] = 26  # AA
+
+    if created:
+        # 새로 만든 헤더 스타일링
+        ac_letter = get_column_letter(AC_IDX + 1)
+        ad_letter = get_column_letter(AD_IDX + 1)
+        try:
+            ws_portfolio.format(f'{ac_letter}1:{ad_letter}1', {
+                'textFormat': {'bold': True, 'foregroundColor': {'red': 1, 'green': 1, 'blue': 1}},
+                'backgroundColor': {'red': 0.4, 'green': 0.5, 'blue': 0.3},
+                'horizontalAlignment': 'CENTER',
+            })
+            time.sleep(0.5)
+        except Exception:
+            pass
+        print(f"  🆕 컬럼 생성: {created}")
+    else:
+        print("  ✅ 시가평가액·수익률 컬럼 이미 존재")
+
+    print(f"   최종 컬럼 매핑: acq={header_map.get('acq_col')}, "
+          f"eval={header_map.get('eval_col')}, return={header_map.get('return_col')}, "
+          f"updated={header_map.get('updated_col')}")
+
     return header_map
 
 
@@ -302,6 +302,9 @@ def compare_holdings(portfolio_rows, header_map, new_holdings):
     """
     isin_col = header_map.get('isin_col', 1)
     amount_col = header_map.get('amount_col')
+    acq_col = header_map.get('acq_col')
+    # 보유금액 컬럼이 없으면(현재 시트 구조) 취득가를 기존 보유 판단 기준으로 사용
+    ref_col = amount_col if amount_col is not None else acq_col
     
     # 포트폴리오의 ISIN 집합
     portfolio_isins = {}
@@ -309,9 +312,9 @@ def compare_holdings(portfolio_rows, header_map, new_holdings):
         if len(row) > isin_col and row[isin_col].strip().startswith('KR'):
             isin = row[isin_col].strip()
             old_amount = 0
-            if amount_col is not None and len(row) > amount_col:
+            if ref_col is not None and len(row) > ref_col:
                 try:
-                    old_amount = float(row[amount_col].replace(',', '')) if row[amount_col].strip() else 0
+                    old_amount = float(row[ref_col].replace(',', '')) if row[ref_col].strip() else 0
                 except:
                     old_amount = 0
             portfolio_isins[isin] = {
