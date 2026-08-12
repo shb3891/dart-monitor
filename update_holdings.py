@@ -496,53 +496,30 @@ def add_new_isins_to_portfolio(ws_portfolio, header_map, new_isins, new_holdings
 
 def mark_gone_isins(ws_portfolio, header_map, gone_isins):
     """
-    사라진 종목의 보유금액을 0으로 (매도/상환 표시)
+    사라진 종목(매도/상환)을 시트에서 행째로 삭제.
+    ⚠️ 여러 행 삭제 시 행 번호가 밀리므로 반드시 아래쪽(큰 row_idx)부터 삭제한다.
+    삭제 전 record_change_history가 '매도/상환'으로 변동이력에 남기므로 추적은 가능.
     """
     if not gone_isins:
         return
-    
-    print(f"\n⚠️ 사라진 종목 {len(gone_isins)}개 처리 중...")
-    
-    amount_col = header_map.get('amount_col')
-    eval_col = header_map.get('eval_col')
-    updated_col = header_map.get('updated_col')
-    
-    if amount_col is None:
-        return
-    
-    from openpyxl.utils import get_column_letter
-    
-    for gone in gone_isins:
+
+    print(f"\n⚠️ 사라진 종목 {len(gone_isins)}개 행 삭제 중...")
+
+    # row_idx 내림차순 정렬 (아래 행부터 지워야 위 행 번호가 안 밀림)
+    to_delete = sorted(gone_isins, key=lambda g: g['row_idx'], reverse=True)
+
+    deleted = 0
+    for gone in to_delete:
         row_idx = gone['row_idx']
-        
-        # 보유금액 0으로
-        if amount_col is not None:
-            col_letter = get_column_letter(amount_col + 1)
-            try:
-                ws_portfolio.update([[0]], range_name=f'{col_letter}{row_idx}')
-                time.sleep(0.3)
-            except Exception as e:
-                print(f"  ⚠ {gone['name']} 업데이트 실패: {e}")
-        
-        # 시가평가액 0
-        if eval_col is not None:
-            col_letter = get_column_letter(eval_col + 1)
-            try:
-                ws_portfolio.update([[0]], range_name=f'{col_letter}{row_idx}')
-                time.sleep(0.3)
-            except Exception as e:
-                pass
-        
-        # 회색 표시
         try:
-            ws_portfolio.format(f'A{row_idx}:Z{row_idx}', {
-                'backgroundColor': {'red': 0.92, 'green': 0.92, 'blue': 0.92}
-            })
-            time.sleep(0.3)
+            ws_portfolio.delete_rows(row_idx)
+            deleted += 1
+            print(f"  🗑 삭제: {gone['name']} ({gone['isin']}) — 행 {row_idx}")
+            time.sleep(0.5)
         except Exception as e:
-            pass
-    
-    print(f"  ✅ {len(gone_isins)}개 처리 완료 (회색 표시)")
+            print(f"  ⚠ {gone['name']} 행 삭제 실패: {e}")
+
+    print(f"  ✅ {deleted}개 종목 행 삭제 완료")
 
 
 # ============================================================
@@ -716,11 +693,15 @@ def main():
     comparison = compare_holdings(portfolio_rows, header_map, new_holdings)
     
     # 6. 업데이트
+    #    순서 주의: 기존 종목 갱신 → 사라진 종목 행 삭제 → 신규 추가.
+    #    (삭제를 먼저 해서 행을 당긴 뒤 신규를 맨 아래에 붙여야 빈 행이 안 생김.
+    #     단 mark_gone_isins에 넘기는 row_idx는 삭제 전 원본 기준이므로,
+    #     update_portfolio_sheet 다음, add_new 이전에 삭제해야 안전하다.)
     update_portfolio_sheet(ws_portfolio, header_map, 
                           comparison['matched'], new_holdings)
+    mark_gone_isins(ws_portfolio, header_map, comparison['gone_isins'])
     add_new_isins_to_portfolio(ws_portfolio, header_map, 
                                 comparison['new_isins'], new_holdings)
-    mark_gone_isins(ws_portfolio, header_map, comparison['gone_isins'])
     
     # 7. 변동 이력 기록
     record_change_history(sh, comparison['matched'], 
