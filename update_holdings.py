@@ -36,6 +36,7 @@ HOLDINGS_DIR = 'holdings'  # xlsx 파일 위치
 # 시트 이름
 SHEET_PORTFOLIO = 0
 SHEET_HOLDING_HISTORY = '보유내역_변동이력'
+SHEET_CLOSED = '종료종목'  # 상환/매도 완료 종목 요약 보관
 
 
 # ============================================================
@@ -494,32 +495,71 @@ def add_new_isins_to_portfolio(ws_portfolio, header_map, new_isins, new_holdings
             print(f"  ⚠ 추가 실패: {e}")
 
 
-def mark_gone_isins(ws_portfolio, header_map, gone_isins):
+def _ensure_closed_sheet(sh):
+    """종료종목 탭이 없으면 생성하고 헤더를 세팅. worksheet 객체 반환."""
+    try:
+        ws = sh.worksheet(SHEET_CLOSED)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title=SHEET_CLOSED, rows=500, cols=5)
+        headers = ['종료일', '종목명', 'ISIN', '취득가(억원)', '비고']
+        ws.update([headers], range_name='A1:E1')
+        ws.format('A1:E1', {
+            'textFormat': {'bold': True, 'foregroundColor': {'red': 1, 'green': 1, 'blue': 1}},
+            'backgroundColor': {'red': 0.5, 'green': 0.3, 'blue': 0.3},
+            'horizontalAlignment': 'CENTER',
+        })
+        time.sleep(1.0)
+        print(f"  ✅ '{SHEET_CLOSED}' 시트 새로 생성")
+    return ws
+
+
+def mark_gone_isins(sh, ws_portfolio, header_map, gone_isins):
     """
-    사라진 종목(매도/상환)을 시트에서 행째로 삭제.
-    ⚠️ 여러 행 삭제 시 행 번호가 밀리므로 반드시 아래쪽(큰 row_idx)부터 삭제한다.
-    삭제 전 record_change_history가 '매도/상환'으로 변동이력에 남기므로 추적은 가능.
+    사라진 종목(매도/상환) 처리:
+      1) '종료종목' 탭에 요약(종료일·종목명·ISIN·취득가) 한 줄씩 기록 (신규가 위로 쌓임)
+      2) 포트폴리오 탭에서 해당 행 삭제
+    ⚠️ 여러 행 삭제 시 행 번호가 밀리므로 반드시 아래쪽(큰 row_idx)부터 삭제.
     """
     if not gone_isins:
         return
 
-    print(f"\n⚠️ 사라진 종목 {len(gone_isins)}개 행 삭제 중...")
+    print(f"\n⚠️ 종료 종목 {len(gone_isins)}개 처리 중 (종료탭 이관 + 포트폴리오 삭제)...")
 
-    # row_idx 내림차순 정렬 (아래 행부터 지워야 위 행 번호가 안 밀림)
+    # --- 1) 종료종목 탭에 요약 기록 ---
+    try:
+        ws_closed = _ensure_closed_sheet(sh)
+        new_rows = []
+        for gone in gone_isins:
+            acq = gone.get('old_amount', '')
+            acq_str = acq if acq else ''
+            new_rows.append([TODAY, gone['name'], gone['isin'], acq_str, '매도/상환'])
+        # 기존 데이터 위에 새 기록을 쌓기 (최신이 위로)
+        existing = ws_closed.get_all_values()
+        existing_data = existing[1:] if len(existing) > 1 else []
+        all_rows = new_rows + existing_data
+        ws_closed.batch_clear(['A2:E500'])
+        time.sleep(0.5)
+        if all_rows:
+            ws_closed.update(all_rows, range_name=f'A2:E{len(all_rows)+1}')
+            time.sleep(1.0)
+        print(f"  📁 종료종목 탭에 {len(new_rows)}건 기록")
+    except Exception as e:
+        print(f"  ⚠ 종료종목 탭 기록 실패(삭제는 계속 진행): {e}")
+
+    # --- 2) 포트폴리오에서 행 삭제 (아래→위) ---
     to_delete = sorted(gone_isins, key=lambda g: g['row_idx'], reverse=True)
-
     deleted = 0
     for gone in to_delete:
         row_idx = gone['row_idx']
         try:
             ws_portfolio.delete_rows(row_idx)
             deleted += 1
-            print(f"  🗑 삭제: {gone['name']} ({gone['isin']}) — 행 {row_idx}")
+            print(f"  🗑 포트폴리오에서 삭제: {gone['name']} ({gone['isin']}) — 행 {row_idx}")
             time.sleep(0.5)
         except Exception as e:
             print(f"  ⚠ {gone['name']} 행 삭제 실패: {e}")
 
-    print(f"  ✅ {deleted}개 종목 행 삭제 완료")
+    print(f"  ✅ {deleted}개 종목 종료 처리 완료")
 
 
 # ============================================================
@@ -699,7 +739,7 @@ def main():
     #     update_portfolio_sheet 다음, add_new 이전에 삭제해야 안전하다.)
     update_portfolio_sheet(ws_portfolio, header_map, 
                           comparison['matched'], new_holdings)
-    mark_gone_isins(ws_portfolio, header_map, comparison['gone_isins'])
+    mark_gone_isins(sh, ws_portfolio, header_map, comparison['gone_isins'])
     add_new_isins_to_portfolio(ws_portfolio, header_map, 
                                 comparison['new_isins'], new_holdings)
     
