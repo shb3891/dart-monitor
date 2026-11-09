@@ -65,8 +65,25 @@ def send_telegram(message: str):
 # ============================================================
 # [최신 보유내역 파일 찾기]
 # ============================================================
+def _date_key_from_name(path):
+    """파일명 앞의 YYMMDD 숫자를 날짜 정렬키로 뽑는다.
+    예: 'holdings/261108_보유메자닌.xlsx' → 261108.
+    git 체크아웃은 모든 파일의 수정시각(mtime)을 비슷하게 찍어버려서
+    mtime으로 최신을 고르면 엉뚱한(옛날) 파일이 잡힌다.
+    그래서 파일명에 박힌 날짜로 최신을 판단한다.
+    날짜 패턴이 없으면 -1 (후순위).
+    """
+    base = os.path.basename(path)
+    m = re.match(r'(\d{6})', base)   # 맨 앞 6자리 숫자 YYMMDD
+    if m:
+        return int(m.group(1))
+    return -1
+
+
 def find_latest_holdings_file():
-    """holdings/ 폴더에서 가장 최근 수정된 xlsx 파일 반환"""
+    """holdings/ 폴더에서 '파일명 날짜(YYMMDD)'가 가장 큰 xlsx 파일 반환.
+    날짜가 같거나 패턴이 없으면 수정시각을 보조 기준으로 사용.
+    """
     if not os.path.isdir(HOLDINGS_DIR):
         print(f"⚠ {HOLDINGS_DIR}/ 폴더가 없음. 폴더 생성 후 xlsx 파일 업로드 필요")
         return None
@@ -78,16 +95,20 @@ def find_latest_holdings_file():
     files = []
     for p in patterns:
         files.extend(glob.glob(p))
+    # 임시/숨김 파일 제외 (엑셀 잠금파일 ~$ 등)
+    files = [f for f in files if not os.path.basename(f).startswith('~$')]
     
     if not files:
         print(f"⚠ {HOLDINGS_DIR}/ 폴더에 xlsx 파일 없음")
         return None
     
-    # 수정 시각 기준 최신
-    latest = max(files, key=os.path.getmtime)
-    mtime = datetime.fromtimestamp(os.path.getmtime(latest))
-    print(f"📁 최신 파일: {latest}")
-    print(f"   수정일: {mtime.strftime('%Y-%m-%d %H:%M:%S')}")
+    # 1순위: 파일명 날짜(YYMMDD) 내림차순, 2순위: 수정시각 내림차순
+    files.sort(key=lambda f: (_date_key_from_name(f), os.path.getmtime(f)), reverse=True)
+    latest = files[0]
+
+    print(f"📁 선택된 파일: {latest} (파일명 날짜 기준 최신)")
+    print(f"   후보 파일 {len(files)}개: " +
+          ", ".join(f"{os.path.basename(f)}({_date_key_from_name(f)})" for f in files))
     return latest
 
 
