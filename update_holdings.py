@@ -311,6 +311,22 @@ def ensure_holding_columns(ws_portfolio, headers, header_map):
 # ============================================================
 # [기존 vs 새 보유 비교]
 # ============================================================
+def _core_name(name):
+    """종목명에서 회차·종류·괄호설명을 떼어내 핵심 이름만 추출.
+    예: '코미팜16CB(콜 44.56%)' → '코미팜'
+        '에스씨엘사이언스3CB(콜46.15%)' → '에스씨엘사이언스'
+        '만호제강1EB' → '만호제강'
+    """
+    if not name:
+        return ''
+    s = str(name).strip()
+    # 괄호 이후 제거
+    s = re.sub(r'\(.*$', '', s)
+    # 끝의 "숫자+CB/EB/BW..." 패턴 제거 (회차+종류)
+    s = re.sub(r'\d+\s*(CB|EB|BW|BWR|신종)?\s*$', '', s, flags=re.IGNORECASE)
+    return s.strip()
+
+
 def compare_holdings(portfolio_rows, header_map, new_holdings):
     """
     포트폴리오 시트의 기존 보유 vs 새 보유내역 비교
@@ -372,16 +388,58 @@ def compare_holdings(portfolio_rows, header_map, new_holdings):
                 'row_idx': p_data['row_idx'],
                 'old_amount': p_data['old_amount'],
             })
-    
+
+    # ── ISIN 변경 감지 ──────────────────────────────────────
+    # 콜옵션 부분행사 등으로 증권사가 ISIN 끝자리만 바꾸는 경우가 있다
+    #   (예: KR6041961F82 → KR6041961F8Z).
+    # 이때 옛 ISIN은 gone(사라짐), 새 ISIN은 new(신규)로 잘못 잡히는데,
+    # 사실은 '같은 종목의 ISIN 변경'이므로 종료/신규가 아니라 '변경'으로 처리한다.
+    # 판정: 앞 11자리(KR+9자리 중 끝1자리 제외)가 같고 + 종목명 핵심이 같으면 동일종목.
+    renamed = []
+    still_gone = []
+    new_isins_set = set(new_isins)
+    for gone in gone_isins:
+        g_stem = gone['isin'][:11]
+        # 같은 앞 11자리(KR+식별9자리 중 끝1자리 제외)를 가진 신규 ISIN 찾기.
+        # 한국 ISIN 앞 11자리는 발행사+종목 식별이라, 이게 같으면 사실상 같은 채권의 변형.
+        # (콜 부분행사로 끝자리만 바뀌는 케이스. 종목명이 영문약자↔한글로 달라질 수 있어
+        #  종목명 일치는 요구하지 않고, 대신 로그에 old→new를 남겨 사람이 확인하게 한다.)
+        cand = None
+        for n_isin in new_isins_set:
+            if n_isin[:11] == g_stem and n_isin != gone['isin']:
+                cand = n_isin
+                break
+        if cand:
+            renamed.append({
+                'old_isin': gone['isin'],
+                'new_isin': cand,
+                'row_idx': gone['row_idx'],
+                'name': gone['name'],
+                'new': new_holdings[cand],
+            })
+        else:
+            still_gone.append(gone)
+
+    # renamed로 분류된 새 ISIN은 신규 목록에서 제외
+    if renamed:
+        renamed_new = {r['new_isin'] for r in renamed}
+        new_isins = [n for n in new_isins if n not in renamed_new]
+        gone_isins = still_gone
+
     print(f"\n📊 비교 결과:")
     print(f"  ✅ 매칭: {len(matched)}개")
     print(f"  🆕 신규: {len(new_isins)}개")
+    print(f"  🔁 ISIN 변경: {len(renamed)}개")
     print(f"  ⚠️ 사라짐: {len(gone_isins)}개")
-    
+    if renamed:
+        for r in renamed:
+            print(f"     🔁 {r['name']}: {r['old_isin']} → {r['new_isin']}")
+
     return {
         'matched': matched,
         'new_isins': new_isins,
         'gone_isins': gone_isins,
+        'renamed': renamed,
     }
 
 
@@ -514,6 +572,55 @@ def add_new_isins_to_portfolio(ws_portfolio, header_map, new_isins, new_holdings
             print(f"  ✅ {len(rows_to_add)}개 추가 완료 (노란색 표시)")
         except Exception as e:
             print(f"  ⚠ 추가 실패: {e}")
+
+
+def update_renamed_isins(ws_portfolio, header_map, renamed):
+    """ISIN이 변경된 종목: 기존 행의 ISIN을 새 값으로 바꾸고 보유정보 갱신.
+    종료/신규로 처리하지 않으므로 발행조건(풋콜 일정 등)이 그대로 보존된다.
+    """
+    if not renamed:
+        return
+
+    print(f"\n🔁 ISIN 변경 종목 {len(renamed)}개 갱신 중...")
+
+    from openpyxl.utils import get_column_letter
+    isin_col = header_map.get('isin_col', 1)
+    acq_col = header_map.get('acq_col')
+    eval_col = header_map.get('eval_col')
+    return_col = header_map.get('return_col')
+    updated_col = header_map.get('updated_col')
+
+    for r in renamed:
+        row_idx = r['row_idx']
+        new = r['new']
+        # ISIN 갱신
+        try:
+            col_letter = get_column_letter(isin_col + 1)
+            ws_portfolio.update([[r['new_isin']]], range_name=f'{col_letter}{row_idx}')
+            time.sleep(0.3)
+        except Exception as e:
+            print(f"  ⚠ {r['name']} ISIN 갱신 실패: {e}")
+            continue
+        # 보유정보 갱신 (취득가/평가액/수익률/업데이트일)
+        for col, key in [(acq_col, 'acq_billion'), (eval_col, 'eval_billion'),
+                         (return_col, 'return_pct')]:
+            if col is not None:
+                try:
+                    cl = get_column_letter(col + 1)
+                    ws_portfolio.update([[new.get(key, '')]], range_name=f'{cl}{row_idx}')
+                    time.sleep(0.3)
+                except Exception:
+                    pass
+        if updated_col is not None:
+            try:
+                cl = get_column_letter(updated_col + 1)
+                ws_portfolio.update([[TODAY]], range_name=f'{cl}{row_idx}')
+                time.sleep(0.3)
+            except Exception:
+                pass
+        print(f"  🔁 {r['name']}: {r['old_isin']} → {r['new_isin']} (행 {row_idx} 갱신)")
+
+    print(f"  ✅ {len(renamed)}개 ISIN 변경 처리 완료")
 
 
 def _ensure_closed_sheet(sh):
@@ -760,6 +867,8 @@ def main():
     #     update_portfolio_sheet 다음, add_new 이전에 삭제해야 안전하다.)
     update_portfolio_sheet(ws_portfolio, header_map, 
                           comparison['matched'], new_holdings)
+    # ISIN 변경 갱신은 행 삭제보다 먼저 (삭제하면 row_idx가 밀리므로)
+    update_renamed_isins(ws_portfolio, header_map, comparison.get('renamed', []))
     mark_gone_isins(sh, ws_portfolio, header_map, comparison['gone_isins'])
     add_new_isins_to_portfolio(ws_portfolio, header_map, 
                                 comparison['new_isins'], new_holdings)
