@@ -706,8 +706,9 @@ def _call_dates_from_narrative(clean):
             break
     dates = []
     for m in re.finditer(
-            r'(\d+)\s*(?:개월|년)이?\s*(?:경과한|되는)\s*날?(?:인)?(?:의\s*전일)?\s*'
-            r'\(?\s*(\d{4})\s*년?\s*(\d{1,2})\s*월?\s*(\d{1,2})\s*일?\s*\)?', section):
+            r'(\d+(?:\.\d+)?)\s*(?:개월|년)\s*(?:\([^)]*\))?\s*(?:이|가|에)?\s*'
+            r'(?:경과한|되는|해당하는|해당되는)\s*날?(?:인)?(?:의\s*전일)?\s*'
+            r'\(?\s*(\d{4})\s*[년\-]?\s*(\d{1,2})\s*[월\-]?\s*(\d{1,2})\s*일?\s*\)?', section):
         try:
             dates.append((m.start(), f"{int(m.group(2)):04d}-{int(m.group(3)):02d}-{int(m.group(4)):02d}"))
         except Exception:
