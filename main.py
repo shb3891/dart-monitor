@@ -624,6 +624,20 @@ def _call_all(clean):
             if rows:
                 _dedup_add([(int(r[0]), _yy_to_iso(r[1]), _yy_to_iso(r[2]),
                              _yy_to_iso(r[2]), r[3]) for r in rows])
+        if not schedule:  # 1날짜(지급기일만)+가액 ISO — 예: 삼보모터스 "1차 2026-05-29 전자등록금액의104.06%"
+            rows = re.findall(
+                r'(\d{1,2})\s*차\s+(\d{4}-\d{2}-\d{2})\s+'
+                r'(?:전자등록금액의\s*)?(\d{1,3}(?:\.\d{1,6})?)\s*%', region)
+            if rows:
+                # 날짜가 지급기일 1개뿐 → from/to/pay 모두 그 날짜로
+                _dedup_add([(int(r[0]), r[1], r[1], r[1], r[2]) for r in rows])
+        if not schedule:  # 1날짜(지급기일만)+가액 한국어날짜
+            rows = re.findall(
+                r'(\d{1,2})\s*차\s+(\d{4}\s*년\s*\d{1,2}\s*월\s*\d{1,2}\s*일)\s+'
+                r'(?:전자등록금액의\s*)?(\d{1,3}(?:\.\d{1,6})?)\s*%', region)
+            if rows:
+                _dedup_add([(int(r[0]), _kr_to_iso(r[1]), _kr_to_iso(r[1]),
+                             _kr_to_iso(r[1]), r[2]) for r in rows])
 
     schedule.sort(key=lambda x: x['chasu'])
 
