@@ -701,6 +701,29 @@ def _call_all(clean):
     return schedule, ytc, ratio, is_fallback
 
 
+def _call_period_months(clean):
+    """서술문 콜에서 행사 주기(매 N개월)를 추출. 없으면 None.
+    예: '매 3개월에 해당하는 날', '매 1개월이 되는 날', '매 6개월마다' → 3/1/6
+    매도청구권(Call Option) 섹션 근처에서만 찾아 PUT 주기와 섞이지 않게 한다.
+    """
+    text = re.sub(r'([가-힣])\n([가-힣])', r'\1\2', clean)
+    # 콜 섹션 앵커 이후 구간에서만 탐색
+    anchors = [m.start() for m in re.finditer(
+        r'매도청구권|Call\s*[Oo]ption|CALL\s*OPTION', text, re.IGNORECASE)]
+    if not anchors:
+        return None
+    region = text[anchors[0]:anchors[0] + 2000]
+    m = re.search(r'매\s*(\d+)\s*개월', region)
+    if m:
+        try:
+            v = int(m.group(1))
+            if 1 <= v <= 12:
+                return v
+        except ValueError:
+            pass
+    return None
+
+
 def _call_dates_from_narrative(clean):
     """표 없을 때 서술문에서 CALL 시작/종료 (상세 앵커 우선)"""
     text = re.sub(r'([가-힣])\n([가-힣])', r'\1\2', clean)
@@ -964,7 +987,43 @@ def dart_parse_disclosure(correction_rcept_no, original_rcept_no, xrc_price=''):
             if cb:
                 result['call_begin'] = cb
                 result['call_end'] = ce
+                # 주기(매 N개월)도 함께 추출 → 차수별 날짜 자동생성 시도
+                period = _call_period_months(text)
+                result['call_period_months'] = period
                 break
+
+    # 서술문 콜에 시작·종료·주기가 모두 있으면 call_schedule을 '추정'으로 자동생성
+    #   표 파싱이 실패한 종목(발행사마다 표 양식이 달라 못 읽는 경우)의 콜 누락 방지.
+    #   relativedelta가 월말(2/29 등)을 자동 보정하므로 공시 표와 대체로 일치하나,
+    #   영업일 조정까지는 반영 못 해 하루이틀 오차 가능 → is_estimated 플래그로 표시.
+    if (not result['call_schedule'] and result['call_ratio']
+            and result['call_begin'] not in ('', '-', None)
+            and result['call_end'] not in ('', '-', None)
+            and result.get('call_period_months')):
+        try:
+            cb_dt = datetime.strptime(result['call_begin'], '%Y-%m-%d')
+            ce_dt = datetime.strptime(result['call_end'], '%Y-%m-%d')
+            pm = int(result['call_period_months'])
+            gen = []
+            n = 0
+            cur = cb_dt
+            while cur <= ce_dt and n < 60:
+                gen.append(cur)
+                n += 1
+                cur = cb_dt + relativedelta(months=pm * n)
+            if len(gen) >= 1:
+                result['call_schedule'] = [{
+                    'chasu': i + 1,
+                    'from_date': d.strftime('%Y-%m-%d'),
+                    'to_date': d.strftime('%Y-%m-%d'),
+                    'pay_date': d.strftime('%Y-%m-%d'),
+                    'rate': '',
+                    'estimated': True,   # 추정 생성 플래그
+                } for i, d in enumerate(gen)]
+                print(f"  🔸 서술문 CALL 추정 스케줄 생성: {len(gen)}개 차수 "
+                      f"(매 {pm}개월, {result['call_begin']}~{result['call_end']}) ⚠️추정")
+        except Exception as e:
+            print(f"  ⚠ 서술문 CALL 추정 생성 실패: {e}")
 
     if not result['call_schedule'] and not result['call_ratio']:
         result['call_begin'] = '-'
@@ -1196,9 +1255,13 @@ def build_schedule_rows(data, capital_actions=None):
                      put.get('pay_date', '') or '', rate_str, capital_note])
     for call in data.get('call_schedule', []):
         rate_str = f"{call['rate']}%" if call.get('rate') else ''
+        # 추정 생성된 콜(서술문에서 주기로 자동생성)은 비고에 '추정' 표기
+        note = capital_note
+        if call.get('estimated'):
+            note = ('추정' if not note else f"{note} / 추정")
         rows.append([isin, name, '콜옵션', f"{call['chasu']}차",
                      call.get('from_date', '') or '', call.get('to_date', '') or '',
-                     call.get('pay_date', '') or '', rate_str, capital_note])
+                     call.get('pay_date', '') or '', rate_str, note])
     return rows
 
 
